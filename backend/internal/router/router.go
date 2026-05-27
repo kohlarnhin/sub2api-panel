@@ -1,6 +1,11 @@
 package router
 
 import (
+	"net/http"
+	"os"
+	"path"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -11,8 +16,8 @@ import (
 	"github.com/zhujiangyong/sub2api-panel/backend/internal/stats"
 )
 
-// New 构造 gin Engine，注册 /api/stats/* 路由。
-func New(svc *stats.Service, sseInterval time.Duration, logger *zap.Logger) *gin.Engine {
+// New 构造 gin Engine，注册 /api/stats/* 路由，并可选托管前端静态文件。
+func New(svc *stats.Service, sseInterval time.Duration, logger *zap.Logger, staticDir string) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.Use(ginLogger(logger))
@@ -47,7 +52,40 @@ func New(svc *stats.Service, sseInterval time.Duration, logger *zap.Logger) *gin
 		s.GET("/historical", statsH.Historical)
 	}
 
+	if staticDir != "" {
+		registerStatic(r, staticDir)
+	}
+
 	return r
+}
+
+func registerStatic(r *gin.Engine, staticDir string) {
+	staticFS := http.Dir(staticDir)
+	fileServer := http.FileServer(staticFS)
+
+	r.NoRoute(func(c *gin.Context) {
+		if c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead {
+			c.Status(http.StatusNotFound)
+			return
+		}
+		if c.Request.URL.Path == "/api" || strings.HasPrefix(c.Request.URL.Path, "/api/") {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+			return
+		}
+
+		requestPath := strings.TrimPrefix(path.Clean(c.Request.URL.Path), "/")
+		if requestPath == "." || requestPath == "" {
+			requestPath = "index.html"
+		}
+
+		fullPath := filepath.Join(staticDir, requestPath)
+		if info, err := os.Stat(fullPath); err != nil || info.IsDir() {
+			c.File(filepath.Join(staticDir, "index.html"))
+			return
+		}
+
+		fileServer.ServeHTTP(c.Writer, c.Request)
+	})
 }
 
 func ginLogger(logger *zap.Logger) gin.HandlerFunc {

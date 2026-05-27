@@ -1,0 +1,9 @@
+services:
+  sub2api-panel:
+    image: ghcr.io/kohlarnhin/sub2api-panel:latest
+    container_name: sub2api-panel
+    restart: unless-stopped
+    ports:
+      - "8088:8088"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro

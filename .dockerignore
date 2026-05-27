@@ -1,0 +1,17 @@
+.git
+.github
+.idea
+.vscode
+.DS_Store
+
+backend/config.yaml
+backend/*.log
+backend/server
+
+frontend/node_modules
+frontend/dist
+frontend/.vite
+frontend/*.log
+frontend/*.tsbuildinfo
+
+sub2api

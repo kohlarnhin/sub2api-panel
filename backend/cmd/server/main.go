@@ -20,6 +20,7 @@ import (
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to config file")
+	staticPath := flag.String("static", "", "path to frontend dist directory")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -56,7 +57,7 @@ func main() {
 		cfg.Server.AccountMonitorGroupID,
 	)
 
-	r := router.New(svc, time.Duration(cfg.Server.SSEIntervalSeconds)*time.Second, logger)
+	r := router.New(svc, time.Duration(cfg.Server.SSEIntervalSeconds)*time.Second, logger, *staticPath)
 
 	srv := &http.Server{
 		Addr:              cfg.Server.Addr,
