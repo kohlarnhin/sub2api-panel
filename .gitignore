@@ -1,0 +1,19 @@
+# Go
+backend/server
+backend/config.yaml
+backend/*.log
+
+# Node
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.log
+frontend/*.tsbuildinfo
+
+# Editor
+.idea/
+.vscode/
+.DS_Store
+
+# Reference upstream repo (read-only, not part of this project)
+sub2api/

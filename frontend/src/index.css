@@ -1,0 +1,78 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  font-synthesis: none;
+  --bg: #faf9f5;
+  --ink: #1f1e1c;
+  --coral: #c96442;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: 'DM Sans', ui-sans-serif, system-ui, sans-serif;
+  font-feature-settings: 'ss01', 'ss02';
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* 全局去掉非交互元素的焦点框：本面板只是只读看板，没有按钮/链接需要 focus ring */
+*:focus,
+*:focus-visible {
+  outline: none !important;
+}
+/* 但保留键盘可达性给真正可交互元素（这里暂时没有） */
+button:focus-visible,
+a:focus-visible,
+input:focus-visible {
+  outline: 2px solid var(--coral) !important;
+  outline-offset: 2px;
+}
+
+/* iOS / Webkit 点击高亮全局关闭 */
+* {
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* 数字 tabular */
+.num {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum', 'zero';
+}
+
+/* 小标签 */
+.label {
+  font-family: 'DM Sans', ui-sans-serif, system-ui, sans-serif;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: #73706a;
+}
+
+/* Recharts 主题 */
+.recharts-text {
+  font-family: 'JetBrains Mono', ui-monospace, monospace !important;
+  font-size: 10px !important;
+  fill: #a09c8e !important;
+}
+.recharts-cartesian-axis-line {
+  stroke: transparent !important;
+}
+.recharts-cartesian-axis-tick-line {
+  stroke: #e5e2d6 !important;
+}
+.recharts-cartesian-grid line {
+  stroke: #ece9de !important;
+  stroke-dasharray: 0 !important;
+}
