@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sub2API Panel Release"
+  short_description: "Project branch and release workflow for sub2api-panel."
+  default_prompt: "Use this skill when changing or releasing sub2api-panel."
