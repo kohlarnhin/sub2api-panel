@@ -68,7 +68,7 @@ export function TrendChart({ rows }: Props) {
 
       <div className="min-h-0 flex-1 px-2 pb-2">
         <ResponsiveContainer width="100%" height="100%">
-          <ComposedChart data={data} margin={{ top: 8, right: 16, bottom: 4, left: 4 }}>
+          <ComposedChart data={data} margin={{ top: 8, right: 16, bottom: 4, left: 12 }}>
             <defs>
               <linearGradient id="costFill" x1="0" y1="0" x2="0" y2="1">
                 <stop offset="0%" stopColor="#506b3a" stopOpacity={0.22} />
@@ -86,7 +86,7 @@ export function TrendChart({ rows }: Props) {
               tickLine={false}
               axisLine={false}
               tickFormatter={(v) => formatCompact(v as number)}
-              width={42}
+              width={60}
             />
             <YAxis
               yAxisId="cost"

@@ -1,5 +1,8 @@
 services:
   sub2api-panel:
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: ghcr.io/kohlarnhin/sub2api-panel:latest
     container_name: sub2api-panel
     restart: unless-stopped

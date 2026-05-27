@@ -45,14 +45,14 @@ export function TokenRanking({ rows }: Props) {
         ) : (
           <table className="w-full table-fixed border-separate border-spacing-0 text-[13px]">
             <colgroup>
+              <col className="w-[21%]" />
               <col className="w-[20%]" />
-              <col className="w-[22%]" />
+              <col className="w-[9%]" />
+              <col className="w-[9%]" />
               <col className="w-[10%]" />
-              <col className="w-[10%]" />
-              <col className="w-[10%]" />
-              <col className="w-[10%]" />
+              <col className="w-[9%]" />
               <col className="w-[11%]" />
-              <col className="w-[7%]" />
+              <col className="w-[11%]" />
             </colgroup>
             <thead>
               <tr className="text-left">
@@ -143,14 +143,14 @@ export function TokenRanking({ rows }: Props) {
 
                     {/* Token bar */}
                     <td className="border-t border-warmgray-100 py-3 pr-4">
-                      <div className="flex items-center gap-3">
+                      <div className="flex items-center gap-2">
                         <div className="h-2 flex-1 overflow-hidden rounded-full bg-warmgray-100">
                           <div
                             className="h-2 rounded-full bg-coral-500 transition-all"
                             style={{ width: `${Math.max(3, pct)}%` }}
                           />
                         </div>
-                        <span className="num w-20 shrink-0 text-right text-[13px] font-medium text-warmgray-900">
+                        <span className="num w-[68px] shrink-0 text-right text-[13px] font-medium text-warmgray-900">
                           {formatCompact(r.total_tokens)}
                         </span>
                       </div>
