@@ -15,6 +15,9 @@ permissions:
   contents: read
   packages: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   docker:
     if: github.event_name == 'workflow_dispatch' || github.ref_type == 'tag'
