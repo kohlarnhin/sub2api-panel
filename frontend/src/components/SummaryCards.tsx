@@ -1,5 +1,7 @@
 import type { HistoricalSummary, TodaySummary } from '@/types'
 import { formatCompact, formatCompactCurrency } from '@/lib/format'
+import { useBouncyStagger } from '@/hooks/useGsap'
+import { AnimatedNumber } from '@/components/AnimatedNumber'
 
 type Props = {
   today: TodaySummary | null
@@ -7,7 +9,9 @@ type Props = {
 }
 
 type StatValue = {
-  value: string
+  num?: number
+  format?: (v: number) => string
+  text?: string
   unit: string
   accent: string
   size?: 'sm' | 'md'
@@ -22,14 +26,17 @@ type Card = {
 
 const DASH = '—'
 
-function compact(n: number, available: boolean): string {
-  if (!available) return DASH
-  return formatCompact(n)
-}
-
-function compactCurrency(n: number, available: boolean): string {
-  if (!available) return DASH
-  return formatCompactCurrency(n)
+function numericStat(
+  available: boolean,
+  value: number,
+  format: (v: number) => string,
+  unit: string,
+  accent: string,
+  size?: 'sm' | 'md',
+): StatValue {
+  return available
+    ? { num: value, format, unit, accent, size }
+    : { text: DASH, unit, accent, size }
 }
 
 function buildCards(today: TodaySummary, hist: HistoricalSummary | null): Card[] {
@@ -39,12 +46,14 @@ function buildCards(today: TodaySummary, hist: HistoricalSummary | null): Card[]
     {
       label: '今日',
       primary: {
-        value: formatCompact(today.total_tokens),
+        num: today.total_tokens,
+        format: formatCompact,
         unit: 'Token',
         accent: 'text-coral-500',
       },
       secondary: {
-        value: formatCompactCurrency(today.total_cost),
+        num: today.total_cost,
+        format: formatCompactCurrency,
         unit: '消费',
         accent: 'text-moss',
       },
@@ -52,41 +61,51 @@ function buildCards(today: TodaySummary, hist: HistoricalSummary | null): Card[]
     {
       label: '累计',
       badge: histOK ? undefined : '未启用',
-      primary: {
-        value: compact(hist?.total_tokens ?? 0, histOK),
-        unit: 'Token',
-        accent: 'text-coral-600',
-      },
-      secondary: {
-        value: compactCurrency(hist?.total_cost ?? 0, histOK),
-        unit: '消费',
-        accent: 'text-moss',
-      },
+      primary: numericStat(
+        histOK,
+        hist?.total_tokens ?? 0,
+        formatCompact,
+        'Token',
+        'text-coral-600',
+      ),
+      secondary: numericStat(
+        histOK,
+        hist?.total_cost ?? 0,
+        formatCompactCurrency,
+        '消费',
+        'text-moss',
+      ),
     },
     {
       label: '请求',
       badge: histOK ? undefined : '累计未启用',
       primary: {
-        value: formatCompact(today.total_requests),
+        num: today.total_requests,
+        format: formatCompact,
         unit: '今日',
         accent: 'text-warmgray-900',
       },
-      secondary: {
-        value: compact(hist?.total_requests ?? 0, histOK),
-        unit: '累计',
-        accent: 'text-coral-600',
-      },
+      secondary: numericStat(
+        histOK,
+        hist?.total_requests ?? 0,
+        formatCompact,
+        '累计',
+        'text-coral-600',
+      ),
     },
     {
       label: '数据周期',
       badge: histOK ? undefined : '未启用',
-      primary: {
-        value: histOK ? String(hist!.days_covered) : DASH,
-        unit: '累计天数',
-        accent: 'text-warmgray-900',
-      },
+      primary: histOK
+        ? {
+            num: hist!.days_covered,
+            format: (v) => String(Math.round(v)),
+            unit: '累计天数',
+            accent: 'text-warmgray-900',
+          }
+        : { text: DASH, unit: '累计天数', accent: 'text-warmgray-900' },
       secondary: {
-        value: histOK && hist!.since ? hist!.since : DASH,
+        text: histOK && hist!.since ? hist!.since : DASH,
         unit: '起始日',
         accent: 'text-coral-600',
         size: 'sm',
@@ -97,12 +116,15 @@ function buildCards(today: TodaySummary, hist: HistoricalSummary | null): Card[]
 
 function StatBlock({ s }: { s: StatValue }) {
   const sizeCls = s.size === 'sm' ? 'text-[18px]' : 'text-[28px]'
+  const cls = `num truncate font-semibold leading-none tracking-tightish ${sizeCls} ${s.accent}`
   return (
     <div className="min-w-0">
-      <div
-        className={`num truncate font-semibold leading-none tracking-tightish ${sizeCls} ${s.accent}`}
-      >
-        {s.value}
+      <div className={cls}>
+        {typeof s.num === 'number' && s.format ? (
+          <AnimatedNumber value={s.num} format={s.format} />
+        ) : (
+          s.text ?? DASH
+        )}
       </div>
       <div className="mt-1.5 text-[11px] text-warmgray-500">{s.unit}</div>
     </div>
@@ -117,11 +139,23 @@ export function SummaryCards({ today, historical }: Props) {
     active_users: 0,
   }
   const cards = buildCards(s, historical)
+  const ref = useBouncyStagger<HTMLDivElement>({
+    selector: '[data-summary-card]',
+    delay: 0.12,
+    stagger: 0.1,
+    staggerFrom: 'random',
+    distance: 28,
+    rotation: 5,
+    scaleFrom: 0.82,
+    duration: 1,
+    ease: 'back.out(1.9)',
+  })
 
   return (
-    <div className="grid shrink-0 grid-cols-4 gap-4">
+    <div ref={ref} className="grid shrink-0 grid-cols-4 gap-4">
       {cards.map((c) => (
         <article
+          data-summary-card
           key={c.label}
           className="flex flex-col rounded-2xl border border-warmgray-200/70 bg-canvas px-5 py-4 shadow-card"
         >

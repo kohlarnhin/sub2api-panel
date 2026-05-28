@@ -1,5 +1,6 @@
 import type { ConnState } from '@/hooks/useStatsStream'
 import { formatTime } from '@/lib/format'
+import { useEntrance } from '@/hooks/useGsap'
 
 type Props = {
   state: ConnState
@@ -27,8 +28,12 @@ const labels: Record<ConnState, { text: string; dot: string; pill: string }> = {
 
 export function StatusBar({ state, generatedAt, timezone }: Props) {
   const { text, dot, pill } = labels[state]
+  const ref = useEntrance<HTMLDivElement>({ from: 'right', delay: 0.05 })
   return (
-    <div className="flex items-center gap-3 text-[12px] text-warmgray-500">
+    <div
+      ref={ref}
+      className="flex items-center gap-3 text-[12px] text-warmgray-500"
+    >
       <span
         className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-[11px] font-medium ring-1 ring-inset ${pill}`}
       >

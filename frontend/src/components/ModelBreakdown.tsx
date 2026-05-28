@@ -1,7 +1,10 @@
-import { useMemo } from 'react'
+import { useLayoutEffect, useMemo, useRef } from 'react'
+import gsap from 'gsap'
 import { Cell, Pie, PieChart, ResponsiveContainer, Tooltip } from 'recharts'
 import type { ModelStat } from '@/types'
 import { formatCurrency } from '@/lib/format'
+import { useBouncyEntrance } from '@/hooks/useGsap'
+import { AnimatedNumber } from '@/components/AnimatedNumber'
 
 type Props = { rows: ModelStat[] }
 
@@ -59,9 +62,43 @@ export function ModelBreakdown({ rows }: Props) {
 
   const totalCost = data.reduce((s, r) => s + r.total_cost, 0)
   const dominant = data[0]
+  const sectionRef = useBouncyEntrance<HTMLElement>({
+    delay: 0.32,
+    distance: 30,
+    rotation: 2.2,
+    scaleFrom: 0.91,
+    duration: 0.95,
+    ease: 'back.out(1.8)',
+  })
+  const listRef = useRef<HTMLUListElement>(null)
+  const listInitialized = useRef(false)
+
+  useLayoutEffect(() => {
+    if (listInitialized.current) return
+    if (data.length === 0) return
+    const items = listRef.current?.querySelectorAll('li')
+    if (!items || items.length === 0) return
+    listInitialized.current = true
+    gsap.fromTo(
+      items,
+      { autoAlpha: 0, x: 12 },
+      {
+        autoAlpha: 1,
+        x: 0,
+        duration: 0.45,
+        ease: 'power3.out',
+        stagger: 0.05,
+        delay: 0.4,
+        clearProps: 'transform',
+      },
+    )
+  }, [data.length])
 
   return (
-    <section className="flex h-full flex-col rounded-2xl border border-warmgray-200/70 bg-canvas shadow-card">
+    <section
+      ref={sectionRef}
+      className="flex h-full flex-col rounded-2xl border border-warmgray-200/70 bg-canvas shadow-card"
+    >
       <header className="shrink-0 px-5 pt-4 pb-2">
         <h2 className="text-[16px] font-semibold tracking-tightish text-warmgray-900">
           模型用量
@@ -84,6 +121,10 @@ export function ModelBreakdown({ rows }: Props) {
                 paddingAngle={2}
                 stroke="#ffffff"
                 strokeWidth={2}
+                isAnimationActive
+                animationBegin={700}
+                animationDuration={1100}
+                animationEasing="ease-out"
               >
                 {data.map((_, i) => (
                   <Cell key={i} fill={PALETTE[i % PALETTE.length]} />
@@ -107,7 +148,7 @@ export function ModelBreakdown({ rows }: Props) {
           </div>
         </div>
 
-        <ul className="min-h-0 overflow-hidden px-3 pb-2 pt-1">
+        <ul ref={listRef} className="min-h-0 overflow-hidden px-3 pb-2 pt-1">
           {data.length === 0 ? (
             <li className="py-6 text-center text-[12px] text-warmgray-400">
               暂无今日数据
@@ -128,10 +169,10 @@ export function ModelBreakdown({ rows }: Props) {
                     {r.model}
                   </span>
                   <span className="num text-right text-moss">
-                    {formatCurrency(r.total_cost, 2)}
+                    <AnimatedNumber value={r.total_cost} format={(v) => formatCurrency(v, 2)} />
                   </span>
                   <span className="num text-right text-warmgray-400">
-                    {pct.toFixed(1)}%
+                    <AnimatedNumber value={pct} format={(v) => `${v.toFixed(1)}%`} />
                   </span>
                 </li>
               )

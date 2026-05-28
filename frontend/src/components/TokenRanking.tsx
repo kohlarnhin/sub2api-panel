@@ -1,5 +1,9 @@
+import { useEffect, useLayoutEffect, useRef } from 'react'
+import gsap from 'gsap'
 import type { UserTokenRank } from '@/types'
 import { formatCompact, formatCurrency, formatNumber } from '@/lib/format'
+import { useAnimatedWidth, useBouncyEntrance } from '@/hooks/useGsap'
+import { AnimatedNumber } from '@/components/AnimatedNumber'
 
 type Props = { rows: UserTokenRank[] }
 
@@ -18,11 +22,168 @@ function avatarBg(rank: number) {
   return 'bg-warmgray-100 text-warmgray-700'
 }
 
-export function TokenRanking({ rows }: Props) {
-  const max = rows[0]?.total_tokens ?? 0
+type RowProps = { r: UserTokenRank; rank: number; max: number }
+
+function TokenRow({ r, rank, max }: RowProps) {
+  const pct = max > 0 ? (r.total_tokens / max) * 100 : 0
+  const barRef = useAnimatedWidth<HTMLDivElement>(Math.max(3, pct), {
+    duration: 1,
+    ease: 'power3.out',
+    initialDelay: 0.55,
+  })
+
+  const cacheSum = r.cache_creation_tokens + r.cache_read_tokens
+  const realInput =
+    r.input_tokens + r.cache_creation_tokens + r.cache_read_tokens
+  const hitRate =
+    realInput > 0 ? (r.cache_read_tokens / realInput) * 100 : -1
+  const hitText = hitRate < 0 ? '—' : `${hitRate.toFixed(1)}%`
+  const hitColor =
+    hitRate < 0
+      ? 'text-warmgray-400'
+      : hitRate >= 80
+      ? 'text-moss'
+      : hitRate >= 50
+      ? 'text-warmgray-700'
+      : 'text-coral-500'
+  const hasUsername = !!r.username
+  const hasEmail = !!r.email
+  const fallback = hasUsername
+    ? r.username
+    : hasEmail
+    ? r.email
+    : `user#${r.user_id}`
 
   return (
-    <section className="flex h-full flex-col rounded-2xl border border-warmgray-200/70 bg-canvas shadow-card">
+    <tr className="group transition-colors hover:bg-cream/60">
+      {/* User */}
+      <td className="border-t border-warmgray-100 py-3 pl-6 pr-3">
+        <div className="flex items-center gap-3">
+          <span
+            className={`grid h-8 w-8 shrink-0 place-items-center rounded-full text-[12px] font-semibold ${avatarBg(
+              rank,
+            )}`}
+          >
+            {initials(r.username || r.email)}
+          </span>
+          <div className="min-w-0">
+            {hasUsername && hasEmail ? (
+              <>
+                <div className="truncate text-[13px] font-medium text-warmgray-900">
+                  {r.username}
+                </div>
+                <div className="num truncate text-[11px] text-warmgray-400">
+                  {r.email}
+                </div>
+              </>
+            ) : (
+              <div className="num truncate text-[13px] font-medium text-warmgray-900">
+                {fallback}
+              </div>
+            )}
+          </div>
+        </div>
+      </td>
+
+      {/* Token bar */}
+      <td className="border-t border-warmgray-100 py-3 pr-4">
+        <div className="flex items-center gap-2">
+          <div className="h-2 flex-1 overflow-hidden rounded-full bg-warmgray-100">
+            <div ref={barRef} className="h-2 rounded-full bg-coral-500" />
+          </div>
+          <span className="num w-[68px] shrink-0 text-right text-[13px] font-medium text-warmgray-900">
+            <AnimatedNumber value={r.total_tokens} format={formatCompact} />
+          </span>
+        </div>
+      </td>
+
+      {/* Input */}
+      <td className="num border-t border-warmgray-100 py-3 text-right text-warmgray-700">
+        <AnimatedNumber value={r.input_tokens} format={formatCompact} />
+      </td>
+
+      {/* Output */}
+      <td className="num border-t border-warmgray-100 py-3 text-right text-warmgray-700">
+        <AnimatedNumber value={r.output_tokens} format={formatCompact} />
+      </td>
+
+      {/* Cache (write + read combined) */}
+      <td className="num border-t border-warmgray-100 py-3 text-right text-warmgray-700">
+        <AnimatedNumber value={cacheSum} format={formatCompact} />
+      </td>
+
+      {/* Cache hit rate */}
+      <td
+        className={`num border-t border-warmgray-100 py-3 text-right ${hitColor}`}
+      >
+        {hitText}
+      </td>
+
+      {/* Cost */}
+      <td className="num border-t border-warmgray-100 py-3 text-right text-[14px] font-medium text-moss">
+        <AnimatedNumber value={r.total_cost} format={(v) => formatCurrency(v, 2)} />
+      </td>
+
+      {/* Requests */}
+      <td className="num border-t border-warmgray-100 py-3 pr-6 text-right text-warmgray-700">
+        <AnimatedNumber value={r.request_count} format={formatNumber} />
+      </td>
+    </tr>
+  )
+}
+
+export function TokenRanking({ rows }: Props) {
+  const max = rows[0]?.total_tokens ?? 0
+  const sectionRef = useBouncyEntrance<HTMLElement>({
+    delay: 0.22,
+    distance: 30,
+    rotation: 1.6,
+    scaleFrom: 0.94,
+    duration: 0.85,
+    ease: 'back.out(1.5)',
+  })
+  const tbodyRef = useRef<HTMLTableSectionElement>(null)
+  const initialized = useRef(false)
+
+  useLayoutEffect(() => {
+    if (initialized.current) return
+    if (rows.length === 0) return
+    const tbody = tbodyRef.current
+    if (!tbody) return
+    const trs = tbody.querySelectorAll('tr')
+    if (trs.length === 0) return
+    initialized.current = true
+    gsap.fromTo(
+      trs,
+      { autoAlpha: 0, y: 10 },
+      {
+        autoAlpha: 1,
+        y: 0,
+        duration: 0.45,
+        ease: 'power3.out',
+        stagger: 0.035,
+        clearProps: 'transform',
+      },
+    )
+  }, [rows.length])
+
+  // 每次有新数据时让表头副标题数字短暂闪烁，提示数据已刷新。
+  const counterRef = useRef<HTMLSpanElement>(null)
+  useEffect(() => {
+    const el = counterRef.current
+    if (!el) return
+    gsap.fromTo(
+      el,
+      { color: '#c96442' },
+      { color: '#a09c8e', duration: 1.1, ease: 'power2.out' },
+    )
+  }, [rows.length])
+
+  return (
+    <section
+      ref={sectionRef}
+      className="flex h-full flex-col rounded-2xl border border-warmgray-200/70 bg-canvas shadow-card"
+    >
       <header className="flex shrink-0 items-end justify-between px-6 pt-4 pb-3">
         <div>
           <h2 className="text-[16px] font-semibold tracking-tightish text-warmgray-900">
@@ -33,7 +194,7 @@ export function TokenRanking({ rows }: Props) {
           </p>
         </div>
         <div className="num text-[11px] text-warmgray-400">
-          共 {rows.length} 位
+          共 <span ref={counterRef}>{rows.length}</span> 位
         </div>
       </header>
 
@@ -82,114 +243,10 @@ export function TokenRanking({ rows }: Props) {
                 </th>
               </tr>
             </thead>
-            <tbody>
-              {rows.map((r, i) => {
-                const rank = i + 1
-                const pct = max > 0 ? (r.total_tokens / max) * 100 : 0
-                const cacheSum = r.cache_creation_tokens + r.cache_read_tokens
-                const realInput =
-                  r.input_tokens + r.cache_creation_tokens + r.cache_read_tokens
-                const hitRate =
-                  realInput > 0 ? (r.cache_read_tokens / realInput) * 100 : -1
-                const hitText = hitRate < 0 ? '—' : `${hitRate.toFixed(1)}%`
-                const hitColor =
-                  hitRate < 0
-                    ? 'text-warmgray-400'
-                    : hitRate >= 80
-                    ? 'text-moss'
-                    : hitRate >= 50
-                    ? 'text-warmgray-700'
-                    : 'text-coral-500'
-                const hasUsername = !!r.username
-                const hasEmail = !!r.email
-                const fallback = hasUsername
-                  ? r.username
-                  : hasEmail
-                  ? r.email
-                  : `user#${r.user_id}`
-                return (
-                  <tr
-                    key={r.user_id}
-                    className="group transition-colors hover:bg-cream/60"
-                  >
-                    {/* User */}
-                    <td className="border-t border-warmgray-100 py-3 pl-6 pr-3">
-                      <div className="flex items-center gap-3">
-                        <span
-                          className={`grid h-8 w-8 shrink-0 place-items-center rounded-full text-[12px] font-semibold ${avatarBg(
-                            rank,
-                          )}`}
-                        >
-                          {initials(r.username || r.email)}
-                        </span>
-                        <div className="min-w-0">
-                          {hasUsername && hasEmail ? (
-                            <>
-                              <div className="truncate text-[13px] font-medium text-warmgray-900">
-                                {r.username}
-                              </div>
-                              <div className="num truncate text-[11px] text-warmgray-400">
-                                {r.email}
-                              </div>
-                            </>
-                          ) : (
-                            <div className="num truncate text-[13px] font-medium text-warmgray-900">
-                              {fallback}
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    </td>
-
-                    {/* Token bar */}
-                    <td className="border-t border-warmgray-100 py-3 pr-4">
-                      <div className="flex items-center gap-2">
-                        <div className="h-2 flex-1 overflow-hidden rounded-full bg-warmgray-100">
-                          <div
-                            className="h-2 rounded-full bg-coral-500 transition-all"
-                            style={{ width: `${Math.max(3, pct)}%` }}
-                          />
-                        </div>
-                        <span className="num w-[68px] shrink-0 text-right text-[13px] font-medium text-warmgray-900">
-                          {formatCompact(r.total_tokens)}
-                        </span>
-                      </div>
-                    </td>
-
-                    {/* Input */}
-                    <td className="num border-t border-warmgray-100 py-3 text-right text-warmgray-700">
-                      {formatCompact(r.input_tokens)}
-                    </td>
-
-                    {/* Output */}
-                    <td className="num border-t border-warmgray-100 py-3 text-right text-warmgray-700">
-                      {formatCompact(r.output_tokens)}
-                    </td>
-
-                    {/* Cache (write + read combined) */}
-                    <td className="num border-t border-warmgray-100 py-3 text-right text-warmgray-700">
-                      {formatCompact(cacheSum)}
-                    </td>
-
-                    {/* Cache hit rate */}
-                    <td
-                      className={`num border-t border-warmgray-100 py-3 text-right ${hitColor}`}
-                    >
-                      {hitText}
-                    </td>
-
-                    {/* Cost */}
-                    <td className="num border-t border-warmgray-100 py-3 text-right text-[14px] font-medium text-moss">
-                      {formatCurrency(r.total_cost, 2)}
-                    </td>
-
-                    {/* Requests */}
-                    <td className="num border-t border-warmgray-100 py-3 pr-6 text-right text-warmgray-700">
-                      {formatNumber(r.request_count)}
-                    </td>
-                  </tr>
-                )
-              })}
+            <tbody ref={tbodyRef}>
+              {rows.map((r, i) => (
+                <TokenRow key={r.user_id} r={r} rank={i + 1} max={max} />
+              ))}
             </tbody>
           </table>
         )}

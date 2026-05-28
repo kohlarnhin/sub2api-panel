@@ -1,6 +1,10 @@
+import { useEntrance } from '@/hooks/useGsap'
+
 export function Brandmark() {
+  const ref = useEntrance<HTMLDivElement>({ from: 'left', delay: 0.05 })
+
   return (
-    <div className="flex items-baseline gap-3">
+    <div ref={ref} className="flex items-baseline gap-3">
       <h1 className="text-[22px] font-semibold tracking-tightish text-warmgray-900">
         sub2api
         <span className="text-warmgray-300"> · </span>
