@@ -54,7 +54,7 @@ func main() {
 		repo,
 		time.Duration(cfg.Server.CacheTTLSeconds)*time.Second,
 		cfg.Location.String(),
-		cfg.Server.AccountMonitorGroupID,
+		cfg.Server.AccountMonitorGroupMap(),
 	)
 
 	r := router.New(svc, time.Duration(cfg.Server.SSEIntervalSeconds)*time.Second, logger, *staticPath)

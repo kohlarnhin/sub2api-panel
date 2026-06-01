@@ -48,7 +48,7 @@ type TodaySummary struct {
 	ActiveUsers   int64   `json:"active_users"`
 }
 
-// AccountMonitor 表示指定分组下的账号健康度统计。
+// AccountMonitorItem 表示指定分组下的账号健康度统计。
 //
 // 字段定义：
 //   - total        :  分组下未软删除的账号总数
@@ -57,14 +57,20 @@ type TodaySummary struct {
 //   - abnormal     :  total - available - rate_limited（其他故障/禁用/过期/过载等）
 //
 // group_id == 0 时整张表是禁用状态，前端应展示"未配置"。
-type AccountMonitor struct {
+type AccountMonitorItem struct {
 	Enabled     bool   `json:"enabled"`
+	Share       string `json:"share"`
 	GroupID     int64  `json:"group_id"`
 	GroupName   string `json:"group_name"`
 	Total       int64  `json:"total"`
 	Available   int64  `json:"available"`
 	RateLimited int64  `json:"rate_limited"`
 	Abnormal    int64  `json:"abnormal"`
+}
+
+type AccountMonitor struct {
+	Enabled bool                 `json:"enabled"`
+	Items   []AccountMonitorItem `json:"items"`
 }
 
 // HistoricalSummary 表示来自 sub2api 内置 `usage_dashboard_daily` 聚合表的全平台历史累计。

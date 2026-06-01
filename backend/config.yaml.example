@@ -12,9 +12,10 @@ server:
   cache_ttl_seconds: 5
   # 排行榜返回前 N 条
   top_n: 20
-  # 账号监控展示哪个分组下的账号（填该分组在 sub2api 数据库的 group_id）
-  # 例如 plus 分组的 id。设为 0 表示不展示账号监控。
-  account_monitor_group_id: 0
+  # 账号监控同时刷新这些 share 分组，对应 sub2api groups.id
+  account_monitor_groups:
+    plus-share: 0
+    free-share: 0
 
 # PostgreSQL 连接信息（连接的是 sub2api 同一个库，只读使用）
 database:

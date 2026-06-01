@@ -8,10 +8,10 @@ import (
 
 // Service 在 Repository 之上加一层短 TTL 内存缓存，避免高并发或多个 SSE 客户端打爆数据库。
 type Service struct {
-	repo                  *Repository
-	ttl                   time.Duration
-	tz                    string
-	accountMonitorGroupID int64
+	repo                 *Repository
+	ttl                  time.Duration
+	tz                   string
+	accountMonitorGroups map[string]int64
 
 	mu        sync.Mutex
 	snapshot  *Snapshot
@@ -19,13 +19,13 @@ type Service struct {
 }
 
 // NewService 构造 Service。ttl=0 表示禁用缓存。
-// accountMonitorGroupID == 0 时关闭账号监控卡片。
-func NewService(repo *Repository, ttl time.Duration, tz string, accountMonitorGroupID int64) *Service {
+// accountMonitorGroups 为空时关闭账号监控卡片。
+func NewService(repo *Repository, ttl time.Duration, tz string, accountMonitorGroups map[string]int64) *Service {
 	return &Service{
-		repo:                  repo,
-		ttl:                   ttl,
-		tz:                    tz,
-		accountMonitorGroupID: accountMonitorGroupID,
+		repo:                 repo,
+		ttl:                  ttl,
+		tz:                   tz,
+		accountMonitorGroups: cloneMonitorGroups(accountMonitorGroups),
 	}
 }
 
@@ -60,6 +60,17 @@ func (s *Service) Invalidate() {
 	s.expiresAt = time.Time{}
 }
 
+func cloneMonitorGroups(groups map[string]int64) map[string]int64 {
+	if groups == nil {
+		return map[string]int64{}
+	}
+	cloned := make(map[string]int64, len(groups))
+	for share, groupID := range groups {
+		cloned[share] = groupID
+	}
+	return cloned
+}
+
 func (s *Service) build(ctx context.Context) (*Snapshot, error) {
 	summary, err := s.repo.TodaySummary(ctx)
 	if err != nil {
@@ -81,7 +92,7 @@ func (s *Service) build(ctx context.Context) (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	monitor, err := s.repo.AccountMonitorFor(ctx, s.accountMonitorGroupID)
+	monitor, err := s.accountMonitorSnapshot(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -100,5 +111,27 @@ func (s *Service) build(ctx context.Context) (*Snapshot, error) {
 		ModelBreakdown: models,
 		AccountMonitor: monitor,
 		Historical:     historical,
+	}, nil
+}
+
+func (s *Service) accountMonitorSnapshot(ctx context.Context) (AccountMonitor, error) {
+	groups := cloneMonitorGroups(s.accountMonitorGroups)
+	items := make([]AccountMonitorItem, 0, len(groups))
+
+	for _, share := range []string{"plus-share", "free-share"} {
+		groupID := groups[share]
+		if groupID <= 0 {
+			continue
+		}
+		item, err := s.repo.AccountMonitorFor(ctx, share, groupID)
+		if err != nil {
+			return AccountMonitor{}, err
+		}
+		items = append(items, item)
+	}
+
+	return AccountMonitor{
+		Enabled: len(items) > 0,
+		Items:   items,
 	}, nil
 }

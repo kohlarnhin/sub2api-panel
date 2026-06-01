@@ -8,6 +8,11 @@ import (
 	"github.com/spf13/viper"
 )
 
+const (
+	AccountMonitorPlusShare = "plus-share"
+	AccountMonitorFreeShare = "free-share"
+)
+
 type ServerConfig struct {
 	Addr               string `mapstructure:"addr"`
 	Timezone           string `mapstructure:"timezone"`
@@ -15,8 +20,10 @@ type ServerConfig struct {
 	CacheTTLSeconds    int    `mapstructure:"cache_ttl_seconds"`
 	TopN               int    `mapstructure:"top_n"`
 
-	// AccountMonitorGroupID 指定要在面板"账号监控"卡片中展示哪个分组下的账号统计。
-	// 例如 plus 分组的 id。设为 0 表示禁用账号监控卡片。
+	// AccountMonitorGroups 保存一起刷新的 share 分组对应的 group_id。
+	AccountMonitorGroups map[string]int64 `mapstructure:"account_monitor_groups"`
+
+	// AccountMonitorGroupID 兼容旧配置；未配置 account_monitor_groups 时会作为 plus-share。
 	AccountMonitorGroupID int64 `mapstructure:"account_monitor_group_id"`
 }
 
@@ -114,7 +121,28 @@ func (c *Config) validate() error {
 	if c.Server.TopN <= 0 || c.Server.TopN > 200 {
 		return fmt.Errorf("server.top_n must be in (0, 200]")
 	}
+	for share, groupID := range c.Server.AccountMonitorGroups {
+		if share != AccountMonitorPlusShare && share != AccountMonitorFreeShare {
+			return fmt.Errorf("server.account_monitor_groups contains unsupported share %q", share)
+		}
+		if groupID < 0 {
+			return fmt.Errorf("server.account_monitor_groups.%s must be >= 0", share)
+		}
+	}
 	return nil
+}
+
+func (s ServerConfig) AccountMonitorGroupMap() map[string]int64 {
+	groups := make(map[string]int64, len(s.AccountMonitorGroups))
+	for share, groupID := range s.AccountMonitorGroups {
+		groups[share] = groupID
+	}
+
+	if groups[AccountMonitorPlusShare] == 0 && s.AccountMonitorGroupID > 0 {
+		groups[AccountMonitorPlusShare] = s.AccountMonitorGroupID
+	}
+
+	return groups
 }
 
 // DSN 生成 PostgreSQL DSN。

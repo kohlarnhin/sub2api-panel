@@ -9,9 +9,9 @@ import (
 // AccountMonitorFor 查询指定分组下账号的健康度统计。
 // 字段口径见 types.go 上的注释。
 // 若 groupID <= 0，直接返回 Enabled=false 的空结果，不打数据库。
-func (r *Repository) AccountMonitorFor(ctx context.Context, groupID int64) (AccountMonitor, error) {
+func (r *Repository) AccountMonitorFor(ctx context.Context, share string, groupID int64) (AccountMonitorItem, error) {
 	if groupID <= 0 {
-		return AccountMonitor{Enabled: false}, nil
+		return AccountMonitorItem{Enabled: false, Share: share}, nil
 	}
 
 	const q = `
@@ -52,7 +52,7 @@ func (r *Repository) AccountMonitorFor(ctx context.Context, groupID int64) (Acco
 	if err := r.db.QueryRowContext(ctx, q, groupID).Scan(
 		&groupName, &total, &available, &rateLimited,
 	); err != nil {
-		return AccountMonitor{}, fmt.Errorf("account_monitor: %w", err)
+		return AccountMonitorItem{}, fmt.Errorf("account_monitor: %w", err)
 	}
 
 	// 异常 = 总量 - 限流 - 可用（按用户口径）
@@ -61,8 +61,9 @@ func (r *Repository) AccountMonitorFor(ctx context.Context, groupID int64) (Acco
 		abnormal = 0
 	}
 
-	return AccountMonitor{
+	return AccountMonitorItem{
 		Enabled:     true,
+		Share:       share,
 		GroupID:     groupID,
 		GroupName:   groupName.String,
 		Total:       total,

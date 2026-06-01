@@ -41,14 +41,20 @@ export type TodaySummary = {
   active_users: number
 }
 
-export type AccountMonitor = {
+export type AccountMonitorItem = {
   enabled: boolean
+  share: string
   group_id: number
   group_name: string
   total: number
   available: number
   rate_limited: number
   abnormal: number
+}
+
+export type AccountMonitor = {
+  enabled: boolean
+  items: AccountMonitorItem[]
 }
 
 export type HistoricalSummary = {
