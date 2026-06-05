@@ -29,5 +29,38 @@ database:
   max_idle_conns: 5
   conn_max_lifetime_minutes: 30
 
+# 手机号注册工具 PostgreSQL 数据源（使用 phone_accounts / icloud_emails）
+# 不配置 register_database 时，会回退使用上面的 database。
+register_database:
+  host: "127.0.0.1"
+  port: 5432
+  user: "auto_register"
+  password: "your_password"
+  dbname: "auto_register"
+  sslmode: "require"
+  max_open_conns: 10
+  max_idle_conns: 5
+  conn_max_lifetime_minutes: 30
+
+# Sub2API 上传配置；上传分组 ID 在前端输入并缓存
+sub2api:
+  base_url: "https://your-sub2api.example.com"
+  api_key: "your_sub2api_admin_api_key"
+
+# 邮箱验证码自动获取（Codex 登录绑定邮箱时，从 freemail (Cloudflare Email Worker) 拉取
+# OpenAI 发来的验证码并自动确认）。三项 worker_domain / token / otp_mailbox 都配置后才启用
+# 自动获取；任一缺失则回退为前端手动输入验证码。
+# 对应参考项目 config.yaml 的 freemail.worker_domain / freemail.token / icloud.otp_mailbox。
+freemail:
+  # freemail worker 域名，可带或不带 https:// 前缀
+  worker_domain: "mailfree.example.workers.dev"
+  # freemail worker 的 Bearer Token
+  token: "your_freemail_token"
+  # 接收 OpenAI 验证码的统一收件箱（所有 iCloud 隐藏邮箱转发到此地址）
+  otp_mailbox: "catch@example.com"
+  # 轮询次数与间隔（默认 60 次 × 2 秒 = 最多等待约 2 分钟）
+  poll_attempts: 60
+  poll_interval_seconds: 2
+
 log:
   level: "info"   # debug / info / warn / error

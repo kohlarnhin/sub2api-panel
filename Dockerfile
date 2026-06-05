@@ -9,7 +9,7 @@ RUN pnpm install --frozen-lockfile
 COPY frontend/ ./
 RUN pnpm build
 
-FROM golang:1.22-alpine AS backend-builder
+FROM golang:1.24-alpine AS backend-builder
 
 WORKDIR /src/backend
 
@@ -21,12 +21,13 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/sub2api
 
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates nodejs tzdata
 
 WORKDIR /app
 
 COPY --from=backend-builder /out/sub2api-panel /app/sub2api-panel
 COPY --from=frontend-builder /src/frontend/dist /app/public
+COPY backend/scripts /app/scripts
 
 EXPOSE 8088
 

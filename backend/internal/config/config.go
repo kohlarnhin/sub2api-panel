@@ -42,14 +42,44 @@ type DatabaseConfig struct {
 	ConnMaxLifetimeMinutes int `mapstructure:"conn_max_lifetime_minutes"`
 }
 
+type Sub2APIConfig struct {
+	BaseURL string `mapstructure:"base_url"`
+	APIKey  string `mapstructure:"api_key"`
+}
+
+// FreemailConfig 配置 freemail (Cloudflare Email Worker) 邮箱 OTP 自动获取。
+// Codex 登录绑定邮箱时，OpenAI 会把验证码发到 otp_mailbox，本服务通过
+// worker 的 /api/emails 接口轮询读取。三项均配置后才启用自动获取，否则回退手动输入。
+type FreemailConfig struct {
+	// WorkerDomain 为 freemail worker 域名，可带或不带 https:// 前缀。
+	WorkerDomain string `mapstructure:"worker_domain"`
+	// Token 为 worker 的 Bearer Token。
+	Token string `mapstructure:"token"`
+	// OTPMailbox 为接收 OpenAI 验证码的统一收件箱地址。
+	OTPMailbox string `mapstructure:"otp_mailbox"`
+	// PollAttempts / PollIntervalSeconds 控制轮询次数与间隔（默认 60 次 × 2 秒）。
+	PollAttempts        int `mapstructure:"poll_attempts"`
+	PollIntervalSeconds int `mapstructure:"poll_interval_seconds"`
+}
+
+// IsConfigured 仅当域名、token、OTP 邮箱都配置后返回 true。
+func (f FreemailConfig) IsConfigured() bool {
+	return strings.TrimSpace(f.WorkerDomain) != "" &&
+		strings.TrimSpace(f.Token) != "" &&
+		strings.TrimSpace(f.OTPMailbox) != ""
+}
+
 type LogConfig struct {
 	Level string `mapstructure:"level"`
 }
 
 type Config struct {
-	Server   ServerConfig   `mapstructure:"server"`
-	Database DatabaseConfig `mapstructure:"database"`
-	Log      LogConfig      `mapstructure:"log"`
+	Server           ServerConfig   `mapstructure:"server"`
+	Database         DatabaseConfig `mapstructure:"database"`
+	RegisterDatabase DatabaseConfig `mapstructure:"register_database"`
+	Sub2API          Sub2APIConfig  `mapstructure:"sub2api"`
+	Freemail         FreemailConfig `mapstructure:"freemail"`
+	Log              LogConfig      `mapstructure:"log"`
 
 	Location *time.Location `mapstructure:"-"`
 }
@@ -102,18 +132,24 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("database.max_open_conns", 10)
 	v.SetDefault("database.max_idle_conns", 5)
 	v.SetDefault("database.conn_max_lifetime_minutes", 30)
+	v.SetDefault("register_database.port", 5432)
+	v.SetDefault("register_database.sslmode", "require")
+	v.SetDefault("register_database.max_open_conns", 10)
+	v.SetDefault("register_database.max_idle_conns", 5)
+	v.SetDefault("register_database.conn_max_lifetime_minutes", 30)
+	v.SetDefault("freemail.poll_attempts", 60)
+	v.SetDefault("freemail.poll_interval_seconds", 2)
 	v.SetDefault("log.level", "info")
 }
 
 func (c *Config) validate() error {
-	if c.Database.Host == "" {
-		return fmt.Errorf("database.host is required")
+	if err := c.Database.validate("database"); err != nil {
+		return err
 	}
-	if c.Database.User == "" {
-		return fmt.Errorf("database.user is required")
-	}
-	if c.Database.DBName == "" {
-		return fmt.Errorf("database.dbname is required")
+	if c.RegisterDatabase.IsConfigured() {
+		if err := c.RegisterDatabase.validate("register_database"); err != nil {
+			return err
+		}
 	}
 	if c.Server.SSEIntervalSeconds <= 0 {
 		return fmt.Errorf("server.sse_interval_seconds must be > 0")
@@ -143,6 +179,33 @@ func (s ServerConfig) AccountMonitorGroupMap() map[string]int64 {
 	}
 
 	return groups
+}
+
+func (d DatabaseConfig) IsConfigured() bool {
+	return d.Host != "" ||
+		d.User != "" ||
+		d.Password != "" ||
+		d.DBName != ""
+}
+
+func (d DatabaseConfig) validate(section string) error {
+	if d.Host == "" {
+		return fmt.Errorf("%s.host is required", section)
+	}
+	if d.User == "" {
+		return fmt.Errorf("%s.user is required", section)
+	}
+	if d.DBName == "" {
+		return fmt.Errorf("%s.dbname is required", section)
+	}
+	return nil
+}
+
+func (c *Config) RegisterDatabaseConfig() DatabaseConfig {
+	if !c.RegisterDatabase.IsConfigured() {
+		return c.Database
+	}
+	return c.RegisterDatabase
 }
 
 // DSN 生成 PostgreSQL DSN。

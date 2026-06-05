@@ -14,6 +14,7 @@ import (
 
 	"github.com/zhujiangyong/sub2api-panel/backend/internal/config"
 	"github.com/zhujiangyong/sub2api-panel/backend/internal/db"
+	"github.com/zhujiangyong/sub2api-panel/backend/internal/register"
 	"github.com/zhujiangyong/sub2api-panel/backend/internal/router"
 	"github.com/zhujiangyong/sub2api-panel/backend/internal/stats"
 )
@@ -57,7 +58,31 @@ func main() {
 		cfg.Server.AccountMonitorGroupMap(),
 	)
 
-	r := router.New(svc, time.Duration(cfg.Server.SSEIntervalSeconds)*time.Second, logger, *staticPath)
+	registerConn := conn
+	registerDBConfig := cfg.RegisterDatabaseConfig()
+	if cfg.RegisterDatabase.IsConfigured() {
+		registerConn, err = db.Open(ctx, registerDBConfig)
+		if err != nil {
+			logger.Fatal("open register database", zap.Error(err))
+		}
+		defer registerConn.Close()
+		logger.Info("register database connected",
+			zap.String("host", registerDBConfig.Host),
+			zap.String("dbname", registerDBConfig.DBName),
+		)
+	} else {
+		logger.Info("register database uses primary database",
+			zap.String("host", registerDBConfig.Host),
+			zap.String("dbname", registerDBConfig.DBName),
+		)
+	}
+	registerRepo := register.NewRepository(registerConn)
+	if err := registerRepo.EnsureSchema(ctx); err != nil {
+		logger.Fatal("ensure register schema", zap.Error(err))
+	}
+	registerSvc := register.NewService(registerRepo, cfg, logger, *configPath)
+
+	r := router.New(svc, registerSvc, time.Duration(cfg.Server.SSEIntervalSeconds)*time.Second, logger, *staticPath)
 
 	srv := &http.Server{
 		Addr:              cfg.Server.Addr,

@@ -13,18 +13,19 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zhujiangyong/sub2api-panel/backend/internal/handler"
+	"github.com/zhujiangyong/sub2api-panel/backend/internal/register"
 	"github.com/zhujiangyong/sub2api-panel/backend/internal/stats"
 )
 
 // New 构造 gin Engine，注册 /api/stats/* 路由，并可选托管前端静态文件。
-func New(svc *stats.Service, sseInterval time.Duration, logger *zap.Logger, staticDir string) *gin.Engine {
+func New(svc *stats.Service, registerSvc *register.Service, sseInterval time.Duration, logger *zap.Logger, staticDir string) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.Use(ginLogger(logger))
 
 	r.Use(cors.New(cors.Config{
 		AllowAllOrigins:  true,
-		AllowMethods:     []string{"GET", "OPTIONS"},
+		AllowMethods:     []string{"GET", "POST", "OPTIONS"},
 		AllowHeaders:     []string{"*"},
 		ExposeHeaders:    []string{"Content-Type"},
 		AllowCredentials: false,
@@ -33,6 +34,7 @@ func New(svc *stats.Service, sseInterval time.Duration, logger *zap.Logger, stat
 
 	statsH := handler.NewStatsHandler(svc)
 	sseH := handler.NewSSEHandler(svc, sseInterval, logger)
+	registerH := handler.NewRegisterHandler(registerSvc)
 
 	api := r.Group("/api")
 	{
@@ -51,6 +53,23 @@ func New(svc *stats.Service, sseInterval time.Duration, logger *zap.Logger, stat
 		s.GET("/accounts/monitor", statsH.AccountMonitor)
 		s.GET("/historical", statsH.Historical)
 	}
+
+	phone := api.Group("/phone-register")
+	phone.GET("/template", registerH.Template)
+	phone.POST("/user/login", registerH.LoginUser)
+	phone.GET("/users/:user_id/dashboard", registerH.UserDashboard)
+	phone.GET("/users/:user_id/emails", registerH.UserEmails)
+	phone.POST("/user/emails/generate", registerH.GenerateUserEmails)
+	phone.POST("/user/register/start", registerH.StartUserRegister)
+	phone.POST("/user/register/stop", registerH.StopUserRegister)
+	phone.POST("/herosms/start", registerH.StartHeroSMS)
+	phone.POST("/herosms/batch/start", registerH.StartHeroSMSBatch)
+	phone.POST("/herosms/stop", registerH.StopSession)
+	phone.GET("/herosms/batch/:batch_id", registerH.GetBatch)
+	phone.POST("/herosms/batch/stop", registerH.StopBatch)
+	phone.POST("/email/send", registerH.SendEmail)
+	phone.POST("/email/verify", registerH.VerifyEmail)
+	phone.GET("/session/:session_id", registerH.GetSession)
 
 	if staticDir != "" {
 		registerStatic(r, staticDir)
