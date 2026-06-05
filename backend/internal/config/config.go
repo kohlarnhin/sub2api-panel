@@ -48,25 +48,23 @@ type Sub2APIConfig struct {
 }
 
 // FreemailConfig 配置 freemail (Cloudflare Email Worker) 邮箱 OTP 自动获取。
-// Codex 登录绑定邮箱时，OpenAI 会把验证码发到 otp_mailbox，本服务通过
-// worker 的 /api/emails 接口轮询读取。三项均配置后才启用自动获取，否则回退手动输入。
+// worker/token 来自配置；实际接收验证码邮箱来自 register_users.otp_email。
 type FreemailConfig struct {
 	// WorkerDomain 为 freemail worker 域名，可带或不带 https:// 前缀。
 	WorkerDomain string `mapstructure:"worker_domain"`
 	// Token 为 worker 的 Bearer Token。
 	Token string `mapstructure:"token"`
-	// OTPMailbox 为接收 OpenAI 验证码的统一收件箱地址。
+	// OTPMailbox 已不作为用户注册登录流程的收件箱；保留字段仅兼容旧配置。
 	OTPMailbox string `mapstructure:"otp_mailbox"`
 	// PollAttempts / PollIntervalSeconds 控制轮询次数与间隔（默认 60 次 × 2 秒）。
 	PollAttempts        int `mapstructure:"poll_attempts"`
 	PollIntervalSeconds int `mapstructure:"poll_interval_seconds"`
 }
 
-// IsConfigured 仅当域名、token、OTP 邮箱都配置后返回 true。
+// IsConfigured 仅当 worker 域名和 token 都配置后返回 true。
 func (f FreemailConfig) IsConfigured() bool {
 	return strings.TrimSpace(f.WorkerDomain) != "" &&
-		strings.TrimSpace(f.Token) != "" &&
-		strings.TrimSpace(f.OTPMailbox) != ""
+		strings.TrimSpace(f.Token) != ""
 }
 
 type LogConfig struct {

@@ -37,6 +37,11 @@ type UserLoginRequest struct {
 	Username string `json:"username" binding:"required"`
 }
 
+type UserUpdateRequest struct {
+	UserID   int64  `json:"user_id" binding:"required"`
+	OTPEmail string `json:"otp_email"`
+}
+
 type UserEmailGenerateRequest struct {
 	UserID            int64  `json:"user_id" binding:"required"`
 	Count             int    `json:"count"`
@@ -61,6 +66,7 @@ type Session struct {
 	ID                   string                 `json:"session_id"`
 	UserID               int64                  `json:"user_id,omitempty"`
 	UserName             string                 `json:"username,omitempty"`
+	OTPMailbox           string                 `json:"otp_email,omitempty"`
 	UserEmailID          int64                  `json:"user_email_id,omitempty"`
 	AccountID            int64                  `json:"account_id,omitempty"`
 	RunID                string                 `json:"run_id,omitempty"`
@@ -134,6 +140,7 @@ type RegisterUser struct {
 	Username  string    `json:"username"`
 	GroupID   int64     `json:"group_id"`
 	IsDuck    bool      `json:"is_duck"`
+	OTPEmail  string    `json:"otp_email"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -196,6 +203,14 @@ type UserSummary struct {
 	AccountRegistered int `json:"account_registered"`
 }
 
+type LoginSummary struct {
+	Queued  int `json:"queued"`
+	Running int `json:"running"`
+	Success int `json:"success"`
+	Failed  int `json:"failed"`
+	Total   int `json:"total"`
+}
+
 type UserRunLog struct {
 	Time    time.Time `json:"time"`
 	Level   string    `json:"level"`
@@ -230,6 +245,7 @@ type UserRun struct {
 type UserDashboard struct {
 	User           RegisterUser  `json:"user"`
 	Summary        UserSummary   `json:"summary"`
+	LoginSummary   LoginSummary  `json:"login_summary"`
 	Run            *UserRun      `json:"run,omitempty"`
 	LatestAccounts []UserAccount `json:"latest_accounts"`
 }

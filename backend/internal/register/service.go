@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	emailOTPManualMessage       = "邮箱验证码已发送，请手动输入邮箱验证码完成 Codex 授权"
+	emailOTPUnavailableMessage  = "邮箱验证码无法自动获取，请检查当前用户接收验证码邮箱和 freemail 配置"
 	emailOTPResendFetchAttempts = 10
 	heroSMSStatusPollInterval   = 10 * time.Second
 	heroSMSStatusTimeout        = 180 * time.Second
@@ -56,10 +56,9 @@ type Service struct {
 	cancelNotify chan struct{}
 	cancelOnce   sync.Once
 
-	userMu     sync.RWMutex
-	userRuns   map[int64]*userRunState
-	loginQueue chan userLoginTask
-	loginOnce  sync.Once
+	userMu      sync.RWMutex
+	userRuns    map[int64]*userRunState
+	loginQueues map[int64]*userLoginQueue
 }
 
 type sessionState struct {
@@ -106,6 +105,10 @@ type userLoginTask struct {
 	AccountID int64
 }
 
+type userLoginQueue struct {
+	tasks chan userLoginTask
+}
+
 func NewService(repo *Repository, cfg *config.Config, logger *zap.Logger, configPath string) *Service {
 	return &Service{
 		repo:    repo,
@@ -126,7 +129,7 @@ func NewService(repo *Repository, cfg *config.Config, logger *zap.Logger, config
 		cancelTasks:    make(map[string]*heroSMSCancelTask),
 		cancelNotify:   make(chan struct{}, 1),
 		userRuns:       make(map[int64]*userRunState),
-		loginQueue:     make(chan userLoginTask, 1000),
+		loginQueues:    make(map[int64]*userLoginQueue),
 	}
 }
 
@@ -151,6 +154,10 @@ func (s *Service) UserDashboard(ctx context.Context, userID int64) (*UserDashboa
 	if err != nil {
 		return nil, err
 	}
+	loginSummary, err := s.repo.UserLoginSummary(ctx, user.ID)
+	if err != nil {
+		return nil, err
+	}
 	accounts, err := s.repo.LatestUserAccounts(ctx, user.ID, 30)
 	if err != nil {
 		return nil, err
@@ -158,16 +165,26 @@ func (s *Service) UserDashboard(ctx context.Context, userID int64) (*UserDashboa
 	return &UserDashboard{
 		User:           *user,
 		Summary:        summary,
+		LoginSummary:   loginSummary,
 		Run:            s.publicUserRun(user.ID),
 		LatestAccounts: accounts,
 	}, nil
 }
 
-func (s *Service) UserEmails(ctx context.Context, userID int64, page, pageSize int) (UserEmailListResponse, error) {
+func (s *Service) UpdateUser(ctx context.Context, req UserUpdateRequest) (*UserDashboard, error) {
+	user, err := s.repo.UpdateRegisterUser(ctx, req.UserID, req.OTPEmail)
+	if err != nil {
+		return nil, err
+	}
+	s.updateActiveUserSessionsOTPEmail(user.ID, user.OTPEmail)
+	return s.UserDashboard(ctx, user.ID)
+}
+
+func (s *Service) UserEmails(ctx context.Context, userID int64, page, pageSize int, search string) (UserEmailListResponse, error) {
 	if _, err := s.repo.GetRegisterUserByID(ctx, userID); err != nil {
 		return UserEmailListResponse{}, err
 	}
-	return s.repo.ListUserEmails(ctx, userID, page, pageSize)
+	return s.repo.ListUserEmails(ctx, userID, page, pageSize, search)
 }
 
 func (s *Service) GenerateUserEmails(ctx context.Context, req UserEmailGenerateRequest) (*UserEmailGenerateResult, error) {
@@ -234,6 +251,9 @@ func (s *Service) StartUserRegister(ctx context.Context, req UserRegisterStartRe
 	user, err := s.repo.GetRegisterUserByID(ctx, req.UserID)
 	if err != nil {
 		return nil, err
+	}
+	if strings.TrimSpace(user.OTPEmail) == "" {
+		return nil, fmt.Errorf("请先为当前用户配置接收验证码邮箱")
 	}
 	summary, err := s.repo.UserSummary(ctx, user.ID)
 	if err != nil {
@@ -412,29 +432,7 @@ func (s *Service) StopBatch(id string) (*Batch, error) {
 	return s.publicBatch(id), nil
 }
 
-func (s *Service) VerifyEmailCode(ctx context.Context, sessionID, code string) (*Session, error) {
-	session := s.getState(sessionID)
-	if session == nil {
-		return nil, fmt.Errorf("手机号注册会话不存在: %s", sessionID)
-	}
-	if session.Status != statusEmailCodeSent && session.Status != statusCodexEmailRequired {
-		return nil, fmt.Errorf("当前状态为 %s，不能确认邮箱验证码", session.Status)
-	}
-	code = strings.TrimSpace(code)
-	if code == "" {
-		return nil, fmt.Errorf("邮箱验证码不能为空")
-	}
-	if session.auth == nil {
-		return nil, fmt.Errorf("注册会话已失效")
-	}
-	if err := s.verifyEmailCodeWithSession(ctx, sessionID, code); err != nil {
-		return s.publicSession(sessionID), err
-	}
-	return s.publicSession(sessionID), nil
-}
-
-// verifyEmailCodeWithSession 执行邮箱验证码确认并续接 Codex 流程，不校验会话状态前置条件，
-// 因此既可被前端手动确认（VerifyEmailCode）调用，也可被自动获取流程（sendEmailCode）直接调用。
+// verifyEmailCodeWithSession 执行自动获取到的邮箱验证码确认并续接 Codex 流程。
 func (s *Service) verifyEmailCodeWithSession(ctx context.Context, sessionID, code string) error {
 	session := s.getState(sessionID)
 	if session == nil {
@@ -443,12 +441,6 @@ func (s *Service) verifyEmailCodeWithSession(ctx context.Context, sessionID, cod
 	if session.auth == nil {
 		return fmt.Errorf("注册会话已失效")
 	}
-	s.traceLogin(sessionID, "email_otp_validate_start", map[string]any{
-		"code":             code,
-		"email_verify_url": session.emailVerifyURL,
-		"email":            session.Email,
-		"user_email_id":    session.UserEmailID,
-	})
 	s.touch(sessionID, statusRunning, "正在确认邮箱验证码", "", nil)
 	respData, err := s.authPostJSON(
 		ctx,
@@ -458,43 +450,15 @@ func (s *Service) verifyEmailCodeWithSession(ctx context.Context, sessionID, cod
 		map[string]any{"code": code},
 	)
 	if err != nil {
-		s.traceLogin(sessionID, "email_otp_validate_error", map[string]any{"code": code, "error": err.Error(), "response": traceJSON(respData)})
 		s.touch(sessionID, statusEmailCodeSent, "邮箱验证码确认失败", err.Error(), nil)
 		return err
 	}
-	s.traceLogin(sessionID, "email_otp_validate_success", map[string]any{"code": code, "response": traceJSON(respData)})
 	// email-otp/validate 成功即代表已把分配的 user_email 绑定到账号。无论后续 token 交换
 	// 是否成功，都立即把该 user_email 标记为已用，避免下次注册重复选到这个已绑定的邮箱。
 	if session.userEmailBindActive && session.UserID > 0 && session.UserEmailID > 0 {
 		s.markUserEmailBound(ctx, session)
 	}
 	return s.finishOrWaitCodex(ctx, sessionID, respData)
-}
-
-func (s *Service) SendEmailCode(ctx context.Context, sessionID string) (*Session, error) {
-	session := s.getState(sessionID)
-	if session == nil {
-		return nil, fmt.Errorf("手机号注册会话不存在: %s", sessionID)
-	}
-	if session.Status != statusCodexEmailRequired && session.Status != statusEmailCodeSent {
-		return s.publicSession(sessionID), fmt.Errorf("当前状态为 %s，不能发送邮箱验证码", session.Status)
-	}
-	// 自动获取模式下，验证码会在后台轮询并按轮次重发，避免阻塞 HTTP 请求；
-	// 前端轮询会话状态即可看到「正在自动获取验证码 → 成功」的进展。手动模式则同步发送即可。
-	if s.email.Configured() {
-		go func() {
-			bgCtx, cancel := context.WithTimeout(context.Background(), emailAutoFetchBudget)
-			defer cancel()
-			if err := s.sendEmailCode(bgCtx, sessionID); err != nil {
-				s.logger.Warn("自动发送/获取邮箱验证码失败", zap.String("session", sessionID), zap.Error(err))
-			}
-		}()
-		return s.publicSession(sessionID), nil
-	}
-	if err := s.sendEmailCode(ctx, sessionID); err != nil {
-		return s.publicSession(sessionID), err
-	}
-	return s.publicSession(sessionID), nil
 }
 
 func (s *Service) sendEmailCode(ctx context.Context, sessionID string) error {
@@ -508,6 +472,7 @@ func (s *Service) sendEmailCode(ctx context.Context, sessionID string) error {
 	if session.auth == nil {
 		return fmt.Errorf("注册会话已失效")
 	}
+	otpMailbox := s.sessionOTPMailbox(session)
 	email := strings.TrimSpace(session.Email)
 	if email == "" {
 		if session.UserID <= 0 {
@@ -529,20 +494,15 @@ func (s *Service) sendEmailCode(ctx context.Context, sessionID string) error {
 		s.mu.Unlock()
 	}
 	emailPageURL := firstString(session.emailContinue, "https://auth.openai.com/add-email")
-	s.traceLogin(sessionID, "add_email_flow_start", map[string]any{
-		"email":          email,
-		"email_page_url": emailPageURL,
-		"email_continue": session.emailContinue,
-	})
 	if emailPageURL != "" {
 		_ = s.authGetDiscardForSession(ctx, session, emailPageURL)
 	}
-	autoFetch := s.email.Configured()
+	autoFetch := s.email.ConfiguredForMailbox(otpMailbox)
 
 	for round := 1; ; round++ {
 		baselineID := 0
 		if autoFetch {
-			baselineID = s.email.LatestEmailID(ctx)
+			baselineID = s.email.LatestEmailIDForMailbox(ctx, otpMailbox)
 		}
 		sendStep := "正在发送邮箱验证码"
 		if round > 1 {
@@ -558,11 +518,9 @@ func (s *Service) sendEmailCode(ctx context.Context, sessionID string) error {
 			map[string]any{"email": email},
 		)
 		if err != nil {
-			s.traceLogin(sessionID, "add_email_send_error", map[string]any{"round": round, "email": email, "error": err.Error(), "response": traceJSON(sendData)})
 			s.touch(sessionID, statusCodexEmailRequired, "邮箱验证码发送失败，可重新发送", err.Error(), sendData)
 			return err
 		}
-		s.traceLogin(sessionID, "add_email_send_success", map[string]any{"round": round, "email": email, "response": traceJSON(sendData)})
 		verifyURL := continueURL(sendData)
 		s.mu.Lock()
 		if current := s.sessions[sessionID]; current != nil {
@@ -573,7 +531,7 @@ func (s *Service) sendEmailCode(ctx context.Context, sessionID string) error {
 		s.mu.Unlock()
 
 		if !autoFetch {
-			s.touch(sessionID, statusEmailCodeSent, emailOTPManualMessage, "", sendData)
+			s.touch(sessionID, statusFailed, emailOTPUnavailableMessage, "", sendData)
 			return nil
 		}
 
@@ -585,7 +543,7 @@ func (s *Service) sendEmailCode(ctx context.Context, sessionID string) error {
 		}
 		s.touch(sessionID, statusRunning, codeStep, "", sendData)
 		s.logUserRunForSession(sessionID, "info", codeStep)
-		code, err := s.email.FetchVerificationCodeAttempts(ctx, baselineID, emailOTPResendFetchAttempts, func() bool {
+		code, err := s.email.FetchVerificationCodeAttemptsForMailbox(ctx, otpMailbox, baselineID, emailOTPResendFetchAttempts, func() bool {
 			return s.isSessionStopped(sessionID)
 		}, func(attempt int, fetchErr error) {
 			step := fmt.Sprintf("邮箱验证码已发送，正在自动获取验证码（第 %d/%d 次）", attempt, emailOTPResendFetchAttempts)
@@ -604,12 +562,12 @@ func (s *Service) sendEmailCode(ctx context.Context, sessionID string) error {
 			s.logUserRunForSession(sessionID, "info", step)
 		})
 		if err != nil {
-			s.touch(sessionID, statusEmailCodeSent, "邮箱验证码自动获取超时，可手动输入或重新发送", err.Error(), sendData)
+			s.touch(sessionID, statusFailed, "邮箱验证码自动获取失败，请检查当前用户接收验证码邮箱", err.Error(), sendData)
 			return nil
 		}
 		if code == "" {
 			if err := ctx.Err(); err != nil {
-				s.touch(sessionID, statusEmailCodeSent, "邮箱验证码自动获取超时，可手动输入或重新发送", err.Error(), sendData)
+				s.touch(sessionID, statusFailed, "邮箱验证码自动获取失败，请检查当前用户接收验证码邮箱", err.Error(), sendData)
 				return nil
 			}
 			step := fmt.Sprintf("连续 %d 次未获取到邮箱验证码，准备重新发送", emailOTPResendFetchAttempts)
@@ -617,7 +575,6 @@ func (s *Service) sendEmailCode(ctx context.Context, sessionID string) error {
 			s.logUserRunForSession(sessionID, "info", step)
 			continue
 		}
-		s.traceLogin(sessionID, "email_otp_code_found", map[string]any{"code": code, "round": round})
 		if err := s.verifyEmailCodeWithSession(ctx, sessionID, code); err != nil {
 			if ctx.Err() == nil && strings.Contains(err.Error(), "wrong_email_otp_code") {
 				step := fmt.Sprintf("邮箱验证码无效，准备重新发送（第 %d 轮）", round+1)
@@ -625,7 +582,7 @@ func (s *Service) sendEmailCode(ctx context.Context, sessionID string) error {
 				s.logUserRunForSession(sessionID, "warn", step)
 				continue
 			}
-			s.touch(sessionID, statusEmailCodeSent, "自动确认邮箱验证码失败，请手动输入邮箱验证码", err.Error(), sendData)
+			s.touch(sessionID, statusFailed, "自动确认邮箱验证码失败，已停止当前账号", err.Error(), sendData)
 			return nil
 		}
 		return nil
@@ -637,26 +594,20 @@ func (s *Service) sendLoginEmailOTP(ctx context.Context, sessionID string, authD
 	if session == nil {
 		return fmt.Errorf("手机号注册会话不存在: %s", sessionID)
 	}
+	otpMailbox := s.sessionOTPMailbox(session)
 	emailPageURL := firstString(continueURL(authData), "https://auth.openai.com/email-verification")
-	autoFetch := s.email.Configured()
+	autoFetch := s.email.ConfiguredForMailbox(otpMailbox)
 	baselineID := 0
 	if autoFetch {
-		baselineID = s.email.LatestEmailID(ctx)
+		baselineID = s.email.LatestEmailIDForMailbox(ctx, otpMailbox)
 	}
 	s.touch(sessionID, statusRunning, "正在发送登录邮箱验证码", "", nil)
 	sendURL := firstString(continueURL(authData), "https://auth.openai.com/api/accounts/email-otp/send")
-	s.traceLogin(sessionID, "login_email_otp_send_start", map[string]any{
-		"send_url":       sendURL,
-		"email_page_url": emailPageURL,
-		"auth_data":      traceJSON(authData),
-	})
 	sendData, err := s.authGetJSON(ctx, session, sendURL, baseHeaders(firstString(emailPageURL, "https://auth.openai.com/log-in/password")))
 	if err != nil {
-		s.traceLogin(sessionID, "login_email_otp_send_error", map[string]any{"error": err.Error(), "response": traceJSON(sendData)})
 		s.touch(sessionID, statusCodexEmailRequired, "登录邮箱验证码发送失败", err.Error(), sendData)
 		return err
 	}
-	s.traceLogin(sessionID, "login_email_otp_send_success", map[string]any{"response": traceJSON(sendData)})
 	verifyURL := firstString(continueURL(sendData), emailPageURL, "https://auth.openai.com/email-verification")
 	s.mu.Lock()
 	if current := s.sessions[sessionID]; current != nil {
@@ -681,13 +632,14 @@ func (s *Service) waitLoginEmailOTP(ctx context.Context, sessionID string, authD
 		current.UpdatedAt = time.Now()
 	}
 	s.mu.Unlock()
-	autoFetch := s.email.Configured()
+	otpMailbox := s.sessionOTPMailbox(session)
+	autoFetch := s.email.ConfiguredForMailbox(otpMailbox)
 	if !autoFetch {
-		s.touch(sessionID, statusEmailCodeSent, emailOTPManualMessage, "", authData)
+		s.touch(sessionID, statusFailed, emailOTPUnavailableMessage, "", authData)
 		return nil
 	}
 	s.touch(sessionID, statusRunning, "登录邮箱验证码已发送，正在自动获取验证码", "", authData)
-	code, err := s.email.FetchVerificationCodeAttempts(ctx, baselineID, emailOTPResendFetchAttempts, func() bool {
+	code, err := s.email.FetchVerificationCodeAttemptsForMailbox(ctx, otpMailbox, baselineID, emailOTPResendFetchAttempts, func() bool {
 		return s.isSessionStopped(sessionID)
 	}, func(attempt int, fetchErr error) {
 		step := fmt.Sprintf("登录邮箱验证码已发送，正在自动获取验证码（第 %d/%d 次）", attempt, emailOTPResendFetchAttempts)
@@ -702,12 +654,11 @@ func (s *Service) waitLoginEmailOTP(ctx context.Context, sessionID string, authD
 		if err != nil {
 			errText = err.Error()
 		}
-		s.touch(sessionID, statusEmailCodeSent, "登录邮箱验证码自动获取超时，请手动输入邮箱验证码", errText, authData)
+		s.touch(sessionID, statusFailed, "登录邮箱验证码自动获取失败，请检查当前用户接收验证码邮箱", errText, authData)
 		return nil
 	}
-	s.traceLogin(sessionID, "login_email_otp_code_found", map[string]any{"code": code})
 	if err := s.verifyEmailCodeWithSession(ctx, sessionID, code); err != nil {
-		s.touch(sessionID, statusEmailCodeSent, "自动确认登录邮箱验证码失败，请手动输入邮箱验证码", err.Error(), authData)
+		s.touch(sessionID, statusFailed, "自动确认登录邮箱验证码失败，已停止当前账号", err.Error(), authData)
 		return nil
 	}
 	return nil
@@ -744,6 +695,7 @@ func (s *Service) newUserSession(apiKey string, user RegisterUser, runID, step s
 	if current := s.sessions[state.ID]; current != nil {
 		current.UserID = user.ID
 		current.UserName = user.Username
+		current.OTPMailbox = strings.TrimSpace(user.OTPEmail)
 		current.RunID = runID
 		current.GroupIDs = normalizeGroupIDs([]int64{user.GroupID})
 		current.UpdatedAt = time.Now()
@@ -915,14 +867,29 @@ func (s *Service) runUserRegister(ctx context.Context, user RegisterUser, apiKey
 }
 
 func (s *Service) enqueueUserLogin(task userLoginTask) {
-	s.loginOnce.Do(func() {
-		go s.runUserLoginQueue()
-	})
-	s.loginQueue <- task
+	if task.UserID <= 0 {
+		s.failUserLoginTask(task, fmt.Errorf("登录任务缺少 user_id"))
+		return
+	}
+	queue := s.userLoginQueue(task.UserID)
+	queue.tasks <- task
 }
 
-func (s *Service) runUserLoginQueue() {
-	for task := range s.loginQueue {
+func (s *Service) userLoginQueue(userID int64) *userLoginQueue {
+	s.userMu.Lock()
+	defer s.userMu.Unlock()
+	queue := s.loginQueues[userID]
+	if queue != nil {
+		return queue
+	}
+	queue = &userLoginQueue{tasks: make(chan userLoginTask, 1000)}
+	s.loginQueues[userID] = queue
+	go s.runUserLoginQueue(userID, queue)
+	return queue
+}
+
+func (s *Service) runUserLoginQueue(userID int64, queue *userLoginQueue) {
+	for task := range queue.tasks {
 		s.processUserLoginTask(task)
 	}
 }
@@ -930,17 +897,17 @@ func (s *Service) runUserLoginQueue() {
 func (s *Service) processUserLoginTask(task userLoginTask) {
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
 	defer cancel()
-	s.startLoginTrace(task.SessionID, task)
-	s.traceLogin(task.SessionID, "login_task_start", map[string]any{
-		"task": traceJSON(task),
-	})
 	user, err := s.repo.GetRegisterUserByID(ctx, task.UserID)
 	if err != nil {
-		s.traceLogin(task.SessionID, "login_task_error", map[string]any{"stage": "get_user", "error": err.Error()})
 		s.failUserLoginTask(task, err)
 		return
 	}
-	s.traceLogin(task.SessionID, "login_task_user_loaded", map[string]any{"user": traceJSON(user)})
+	s.mu.Lock()
+	if current := s.sessions[task.SessionID]; current != nil {
+		current.OTPMailbox = strings.TrimSpace(user.OTPEmail)
+		current.UpdatedAt = time.Now()
+	}
+	s.mu.Unlock()
 	s.updateUserRun(task.UserID, task.RunID, func(run *userRunState) {
 		run.LoginStartedCount++
 		run.CurrentLoginAccountID = task.AccountID
@@ -955,34 +922,26 @@ func (s *Service) processUserLoginTask(task userLoginTask) {
 
 	email, err := s.assignUnusedUserEmail(ctx, task.SessionID, user.ID)
 	if err != nil {
-		s.traceLogin(task.SessionID, "login_task_error", map[string]any{"stage": "assign_email", "error": err.Error()})
 		s.failUserLoginTask(task, err)
 		return
 	}
-	s.traceLogin(task.SessionID, "login_task_email_assigned", map[string]any{"email": traceJSON(email)})
 	if err := s.repo.AttachUserEmailToAccount(ctx, task.AccountID, *email); err != nil {
-		s.traceLogin(task.SessionID, "login_task_error", map[string]any{"stage": "attach_email", "error": err.Error()})
 		s.failUserLoginTask(task, err)
 		return
 	}
-	s.traceLogin(task.SessionID, "login_task_email_attached", map[string]any{"account_id": task.AccountID, "email": traceJSON(email)})
 	if err := s.startCodexLogin(ctx, task.SessionID); err != nil {
-		s.traceLogin(task.SessionID, "login_task_error", map[string]any{"stage": "start_codex_login", "error": err.Error()})
 		s.failUserLoginTask(task, err)
 		return
 	}
 	snapshot := s.publicSession(task.SessionID)
 	if snapshot == nil {
-		s.traceLogin(task.SessionID, "login_task_error", map[string]any{"stage": "snapshot", "error": "登录会话不存在"})
 		s.failUserLoginTask(task, fmt.Errorf("登录会话不存在"))
 		return
 	}
 	if snapshot.Status != statusSuccess {
-		s.traceLogin(task.SessionID, "login_task_error", map[string]any{"stage": "status", "snapshot": traceJSON(snapshot)})
 		s.failUserLoginTask(task, errors.New(firstString(snapshot.Error, snapshot.Step, "Codex 登录未完成")))
 		return
 	}
-	s.traceLogin(task.SessionID, "login_task_success", map[string]any{"snapshot": traceJSON(snapshot)})
 	s.updateUserRun(task.UserID, task.RunID, func(run *userRunState) {
 		run.LoginSuccessCount++
 		run.CurrentLoginAccountID = 0
@@ -1421,22 +1380,14 @@ func (s *Service) startCodexLogin(ctx context.Context, sessionID string) error {
 	if session == nil {
 		return fmt.Errorf("手机号注册会话不存在: %s", sessionID)
 	}
-	s.traceLogin(sessionID, "codex_login_start", map[string]any{"session": traceJSON(session.Session)})
 	auth, err := newAuthSession()
 	if err != nil {
-		s.traceLogin(sessionID, "codex_login_error", map[string]any{"stage": "new_auth_session", "error": err.Error()})
 		return err
 	}
 	authURLValue, oauthState, verifier, err := generateCodexOAuthURL()
 	if err != nil {
-		s.traceLogin(sessionID, "codex_login_error", map[string]any{"stage": "generate_oauth_url", "error": err.Error()})
 		return err
 	}
-	s.traceLogin(sessionID, "codex_oauth_url_generated", map[string]any{
-		"auth_url":      authURLValue,
-		"oauth_state":   oauthState,
-		"code_verifier": verifier,
-	})
 	auth.OAuthState = oauthState
 	auth.CodeVerifier = verifier
 	auth.AuthURL = authURLValue
@@ -1454,38 +1405,16 @@ func (s *Service) startCodexLogin(ctx context.Context, sessionID string) error {
 	s.touch(sessionID, statusRunning, "正在获取 Codex OAuth 会话", "", nil)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, authURLValue, nil)
 	if err != nil {
-		s.traceLogin(sessionID, "codex_login_error", map[string]any{"stage": "build_oauth_request", "error": err.Error()})
 		return err
 	}
 	applyBrowserHeaders(req.Header)
-	s.traceLogin(sessionID, "auth_http_request", map[string]any{
-		"method":  req.Method,
-		"url":     req.URL.String(),
-		"headers": traceHeaders(req.Header),
-		"cookies": authCookieHeaderForURL(auth.Jar, authURLValue),
-	})
 	resp, err := auth.Client.Do(req)
 	if err != nil {
-		s.traceLogin(sessionID, "auth_http_error", map[string]any{"method": req.Method, "url": req.URL.String(), "error": err.Error()})
 		s.touch(sessionID, statusFailed, "Codex 登录失败", err.Error(), nil)
 		return err
 	}
-	body, readErr := ioReadAndClose(resp)
-	s.traceLogin(sessionID, "auth_http_response", map[string]any{
-		"method":       req.Method,
-		"url":          req.URL.String(),
-		"status":       resp.StatusCode,
-		"headers":      traceHeaders(resp.Header),
-		"body":         body,
-		"read_error":   traceError(readErr),
-		"jar_cookies":  authCookieHeaderForURL(auth.Jar, authURLValue),
-		"response_url": req.URL.String(),
-	})
+	_, _ = ioReadAndClose(resp)
 	did := cookieValue(auth.Jar, "https://auth.openai.com/", "oai-did")
-	s.traceLogin(sessionID, "codex_oauth_session_cookie", map[string]any{
-		"oai_did": did,
-		"cookies": authCookieHeader(auth.Jar),
-	})
 	if did == "" {
 		err := fmt.Errorf("Codex 登录未获取到 oai-did: %d", resp.StatusCode)
 		s.touch(sessionID, statusFailed, "Codex 登录失败", err.Error(), nil)
@@ -1493,20 +1422,11 @@ func (s *Service) startCodexLogin(ctx context.Context, sessionID string) error {
 	}
 
 	s.touch(sessionID, statusRunning, "正在提交手机号登录", "", nil)
-	s.traceLogin(sessionID, "sentinel_request", map[string]any{
-		"stage":         "submit_username",
-		"did":           did,
-		"flow":          "authorize_continue",
-		"page_url":      "https://auth.openai.com/log-in",
-		"cookie_header": authCookieHeaderForURL(auth.Jar, "https://auth.openai.com/log-in"),
-	})
 	sentinelHeaders, err := mintSentinelHeaders(ctx, s.sentinelScript, did, "authorize_continue", authCookieHeaderForURL(auth.Jar, "https://auth.openai.com/log-in"), "https://auth.openai.com/log-in")
 	if err != nil {
-		s.traceLogin(sessionID, "sentinel_error", map[string]any{"stage": "submit_username", "error": err.Error()})
 		s.touch(sessionID, statusFailed, "Codex 登录失败", err.Error(), nil)
 		return err
 	}
-	s.traceLogin(sessionID, "sentinel_response", map[string]any{"stage": "submit_username", "headers": traceHeaders(sentinelHeaders)})
 	headers := baseHeaders("https://auth.openai.com/log-in")
 	copyHeaders(headers, sentinelHeaders)
 	loginData, err := s.authPostJSON(ctx, session, "https://auth.openai.com/api/accounts/authorize/continue", headers, map[string]any{
@@ -1532,20 +1452,11 @@ func (s *Service) startCodexLogin(ctx context.Context, sessionID string) error {
 		_ = s.authGetDiscardForSession(ctx, session, loginContinueURL)
 	}
 	s.touch(sessionID, statusRunning, "正在验证 Codex 登录密码", "", nil)
-	s.traceLogin(sessionID, "sentinel_request", map[string]any{
-		"stage":         "submit_password",
-		"did":           did,
-		"flow":          "authorize_continue",
-		"page_url":      passwordPageURL,
-		"cookie_header": authCookieHeaderForURL(auth.Jar, passwordPageURL),
-	})
 	sentinelHeaders, err = mintSentinelHeaders(ctx, s.sentinelScript, did, "authorize_continue", authCookieHeaderForURL(auth.Jar, passwordPageURL), passwordPageURL)
 	if err != nil {
-		s.traceLogin(sessionID, "sentinel_error", map[string]any{"stage": "submit_password", "error": err.Error()})
 		s.touch(sessionID, statusFailed, "Codex 登录失败", err.Error(), nil)
 		return err
 	}
-	s.traceLogin(sessionID, "sentinel_response", map[string]any{"stage": "submit_password", "headers": traceHeaders(sentinelHeaders)})
 	headers = baseHeaders(passwordPageURL)
 	copyHeaders(headers, sentinelHeaders)
 	passwordData, err := s.authPostJSON(
@@ -1618,7 +1529,6 @@ func (s *Service) finishOrWaitCodex(ctx context.Context, sessionID string, authD
 	s.mu.Unlock()
 	groupIDs := session.GroupIDs
 	sub2apiJSON := BuildSub2APIPayload(email, tokenData, groupIDs)
-	s.traceLogin(sessionID, "sub2api_payload_built", map[string]any{"payload": traceJSON(sub2apiJSON)})
 	if session.UserID <= 0 || session.AccountID <= 0 {
 		err := fmt.Errorf("用户会话缺少 user_id 或 account_id")
 		s.touch(sessionID, statusFailed, "用户账号保存失败", err.Error(), authData)
@@ -1630,14 +1540,7 @@ func (s *Service) finishOrWaitCodex(ctx context.Context, sessionID string, authD
 		return err
 	}
 	userEmail := UserEmail{ID: session.UserEmailID, UserID: session.UserID, Email: email}
-	s.traceLogin(sessionID, "db_save_token_start", map[string]any{
-		"account_id":   session.AccountID,
-		"user_email":   traceJSON(userEmail),
-		"token_data":   traceJSON(tokenData),
-		"sub2api_json": traceJSON(sub2apiJSON),
-	})
 	dbResult := s.repo.SaveUserPhoneAccountToken(ctx, session.AccountID, userEmail, tokenData, sub2apiJSON)
-	s.traceLogin(sessionID, "db_save_token_result", map[string]any{"result": traceJSON(dbResult)})
 	if ok, _ := dbResult["ok"].(bool); !ok {
 		errText := firstString(stringValue(dbResult["error"]), "用户账号保存失败")
 		_ = s.repo.UpdateUserAccountStatus(ctx, session.AccountID, statusFailed, errText)
@@ -1652,15 +1555,7 @@ func (s *Service) finishOrWaitCodex(ctx context.Context, sessionID string, authD
 		s.touch(sessionID, statusFailed, "Token 已保存，但上传 Sub2API 失败", err.Error(), authData)
 		return err
 	}
-	s.traceLogin(sessionID, "db_finalize_start", map[string]any{
-		"account_id":    session.AccountID,
-		"user_email":    traceJSON(userEmail),
-		"token_data":    traceJSON(tokenData),
-		"sub2api_json":  traceJSON(sub2apiJSON),
-		"upload_result": traceJSON(uploadResult),
-	})
 	dbResult = s.repo.FinalizeUserPhoneAccount(ctx, session.AccountID, userEmail, tokenData, sub2apiJSON, uploadResult)
-	s.traceLogin(sessionID, "db_finalize_result", map[string]any{"result": traceJSON(dbResult)})
 	if ok, _ := dbResult["ok"].(bool); !ok {
 		errText := firstString(stringValue(dbResult["error"]), "用户账号上传结果保存失败")
 		_ = s.repo.UpdateUserAccountStatus(ctx, session.AccountID, statusFailed, errText)
@@ -1691,11 +1586,6 @@ func (s *Service) completeCodexAuthorization(ctx context.Context, sessionID stri
 	}
 	s.touch(sessionID, statusRunning, "正在处理 Codex 授权", "", nil)
 	cont := continueURL(authData)
-	s.traceLogin(sessionID, "codex_authorization_start", map[string]any{
-		"auth_data":    traceJSON(authData),
-		"continue_url": cont,
-		"page_type":    pageType(authData),
-	})
 
 	// 对齐参考实现 auto-register 的 _complete_codex_authorization：
 	//  1) continue_url 本身就是 localhost 回调时直接使用——这是 app session 落定后服务端
@@ -1711,11 +1601,9 @@ func (s *Service) completeCodexAuthorization(ctx context.Context, sessionID stri
 	)
 	if isLocalCallbackURL(cont) {
 		callbackURL = cont
-		s.traceLogin(sessionID, "codex_callback_from_continue_url", map[string]any{"callback_url": callbackURL})
 	} else {
 		callbackURL, err = s.followForCallback(ctx, session, firstString(cont, "https://auth.openai.com/"))
 		if err != nil {
-			s.traceLogin(sessionID, "codex_callback_follow_error", map[string]any{"start_url": firstString(cont, "https://auth.openai.com/"), "error": err.Error()})
 			return nil, err
 		}
 	}
@@ -1724,7 +1612,6 @@ func (s *Service) completeCodexAuthorization(ctx context.Context, sessionID stri
 		// organization），由 workspace/select 返回的 continue_url 才会跳到本地 callback。
 		callbackURL, err = s.selectWorkspaceForCallback(ctx, session, cont)
 		if err != nil {
-			s.traceLogin(sessionID, "codex_workspace_callback_error", map[string]any{"referer": cont, "error": err.Error()})
 			return nil, err
 		}
 	}
@@ -1740,7 +1627,6 @@ func (s *Service) completeCodexAuthorization(ctx context.Context, sessionID stri
 		return tokenData, nil
 	}
 	if strings.Contains(err.Error(), "missing_existing_app_session") {
-		s.traceLogin(sessionID, "token_exchange_missing_session_retry_workspace", map[string]any{"callback_url": callbackURL, "error": err.Error()})
 		if fallbackURL, fallbackErr := s.selectWorkspaceForCallback(ctx, session, cont); fallbackErr == nil && fallbackURL != "" && fallbackURL != callbackURL {
 			return s.exchangeCallbackForToken(ctx, sessionID, fallbackURL)
 		}
@@ -1750,9 +1636,6 @@ func (s *Service) completeCodexAuthorization(ctx context.Context, sessionID stri
 
 func (s *Service) followForCallback(ctx context.Context, session *sessionState, startURL string) (string, error) {
 	if isLocalCallbackURL(startURL) {
-		if session != nil {
-			s.traceLogin(session.ID, "callback_follow_local_start", map[string]any{"start_url": startURL})
-		}
 		return startURL, nil
 	}
 	if session == nil || session.auth == nil {
@@ -1769,17 +1652,7 @@ func (s *Service) followForCallback(ctx context.Context, session *sessionState, 
 		// 只用 Location 头判断 callback，不从响应体抓 localhost——对齐参考实现，
 		// 避免抓到 consent 页体内未最终确认的 code 导致 missing_existing_app_session。
 		// 仍读尽响应体以便连接复用。
-		body, readErr := ioReadAndClose(response)
-		s.traceLogin(session.ID, "callback_follow_response", map[string]any{
-			"index":       i,
-			"url":         currentURL,
-			"status":      statusCode,
-			"location":    location,
-			"headers":     traceHeaders(response.Header),
-			"body":        body,
-			"read_error":  traceError(readErr),
-			"jar_cookies": authCookieHeaderForURL(session.auth.Jar, currentURL),
-		})
+		_, _ = ioReadAndClose(response)
 		if isLocalCallbackURL(location) {
 			return location, nil
 		}
@@ -1895,13 +1768,6 @@ func (s *Service) exchangeCallbackForToken(ctx context.Context, sessionID, callb
 	query := parsed.Query()
 	code := firstString(firstQuery(query, "code"))
 	state := firstString(firstQuery(query, "state"))
-	s.traceLogin(sessionID, "token_exchange_callback", map[string]any{
-		"callback_url": callbackURL,
-		"code":         code,
-		"state":        state,
-		"oauth_state":  session.oauthState,
-		"verifier":     session.codeVerifier,
-	})
 	if state != session.oauthState {
 		return nil, fmt.Errorf("OAuth state 不匹配")
 	}
@@ -1909,7 +1775,6 @@ func (s *Service) exchangeCallbackForToken(ctx context.Context, sessionID, callb
 	if err != nil {
 		return nil, err
 	}
-	s.traceLogin(sessionID, "token_exchange_success", map[string]any{"token_response": traceJSON(tokenResp)})
 	idToken := stringValue(tokenResp["id_token"])
 	claims := decodeJWTPayload(idToken)
 	authClaims, _ := claims["https://api.openai.com/auth"].(map[string]any)
@@ -2036,29 +1901,11 @@ func (s *Service) authPostJSON(ctx context.Context, session *sessionState, endpo
 		return nil, err
 	}
 	copyHeaders(req.Header, headers)
-	s.traceLogin(session.ID, "auth_http_request", map[string]any{
-		"method":  req.Method,
-		"url":     endpoint,
-		"headers": traceHeaders(req.Header),
-		"cookies": authCookieHeaderForURL(session.auth.Jar, endpoint),
-		"payload": json.RawMessage(raw),
-	})
 	resp, err := session.auth.Client.Do(req)
 	if err != nil {
-		s.traceLogin(session.ID, "auth_http_error", map[string]any{"method": req.Method, "url": endpoint, "error": err.Error()})
 		return nil, err
 	}
 	data, body, err := responseJSON(resp)
-	s.traceLogin(session.ID, "auth_http_response", map[string]any{
-		"method":      req.Method,
-		"url":         endpoint,
-		"status":      resp.StatusCode,
-		"headers":     traceHeaders(resp.Header),
-		"body":        body,
-		"json":        traceJSON(data),
-		"read_error":  traceError(err),
-		"jar_cookies": authCookieHeaderForURL(session.auth.Jar, endpoint),
-	})
 	if err != nil {
 		return data, err
 	}
@@ -2077,28 +1924,11 @@ func (s *Service) authGetJSON(ctx context.Context, session *sessionState, endpoi
 		return nil, err
 	}
 	copyHeaders(req.Header, headers)
-	s.traceLogin(session.ID, "auth_http_request", map[string]any{
-		"method":  req.Method,
-		"url":     endpoint,
-		"headers": traceHeaders(req.Header),
-		"cookies": authCookieHeaderForURL(session.auth.Jar, endpoint),
-	})
 	resp, err := session.auth.Client.Do(req)
 	if err != nil {
-		s.traceLogin(session.ID, "auth_http_error", map[string]any{"method": req.Method, "url": endpoint, "error": err.Error()})
 		return nil, err
 	}
 	data, body, err := responseJSON(resp)
-	s.traceLogin(session.ID, "auth_http_response", map[string]any{
-		"method":      req.Method,
-		"url":         endpoint,
-		"status":      resp.StatusCode,
-		"headers":     traceHeaders(resp.Header),
-		"body":        body,
-		"json":        traceJSON(data),
-		"read_error":  traceError(err),
-		"jar_cookies": authCookieHeaderForURL(session.auth.Jar, endpoint),
-	})
 	if err != nil {
 		return data, err
 	}
@@ -2131,28 +1961,12 @@ func (s *Service) authGetDiscardForSession(ctx context.Context, session *session
 		return err
 	}
 	applyBrowserHeaders(req.Header)
-	s.traceLogin(session.ID, "auth_http_request", map[string]any{
-		"method":  req.Method,
-		"url":     endpoint,
-		"headers": traceHeaders(req.Header),
-		"cookies": authCookieHeaderForURL(session.auth.Jar, endpoint),
-	})
 	resp, err := session.auth.Client.Do(req)
 	if err != nil {
-		s.traceLogin(session.ID, "auth_http_error", map[string]any{"method": req.Method, "url": endpoint, "error": err.Error()})
 		return err
 	}
-	body, readErr := ioReadAndClose(resp)
-	s.traceLogin(session.ID, "auth_http_response", map[string]any{
-		"method":      req.Method,
-		"url":         endpoint,
-		"status":      resp.StatusCode,
-		"headers":     traceHeaders(resp.Header),
-		"body":        body,
-		"read_error":  traceError(readErr),
-		"jar_cookies": authCookieHeaderForURL(session.auth.Jar, endpoint),
-	})
-	return readErr
+	_, err = ioReadAndClose(resp)
+	return err
 }
 
 func (s *Service) authGetNoRedirect(ctx context.Context, auth *AuthSession, endpoint string) (*http.Response, error) {
@@ -2175,20 +1989,9 @@ func (s *Service) authGetNoRedirectForSession(ctx context.Context, session *sess
 		return nil, err
 	}
 	applyBrowserHeaders(req.Header)
-	s.traceLogin(session.ID, "auth_http_request", map[string]any{
-		"method":          req.Method,
-		"url":             endpoint,
-		"headers":         traceHeaders(req.Header),
-		"cookies":         authCookieHeaderForURL(session.auth.Jar, endpoint),
-		"follow_redirect": false,
-	})
 	session.auth.Client.SetFollowRedirect(false)
 	defer session.auth.Client.SetFollowRedirect(true)
-	resp, err := session.auth.Client.Do(req)
-	if err != nil {
-		s.traceLogin(session.ID, "auth_http_error", map[string]any{"method": req.Method, "url": endpoint, "follow_redirect": false, "error": err.Error()})
-	}
-	return resp, err
+	return session.auth.Client.Do(req)
 }
 
 func responseJSON(resp *http.Response) (map[string]any, string, error) {
@@ -2331,6 +2134,28 @@ func cloneUserRun(in *UserRun) *UserRun {
 	out := *in
 	out.Logs = append([]UserRunLog(nil), in.Logs...)
 	return &out
+}
+
+func (s *Service) updateActiveUserSessionsOTPEmail(userID int64, otpEmail string) {
+	if userID <= 0 {
+		return
+	}
+	otpEmail = strings.TrimSpace(otpEmail)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, session := range s.sessions {
+		if session != nil && session.UserID == userID {
+			session.OTPMailbox = otpEmail
+			session.UpdatedAt = time.Now()
+		}
+	}
+}
+
+func (s *Service) sessionOTPMailbox(session *sessionState) string {
+	if session == nil {
+		return ""
+	}
+	return strings.TrimSpace(session.OTPMailbox)
 }
 
 func (s *Service) updateUserRun(userID int64, runID string, update func(*userRunState)) {

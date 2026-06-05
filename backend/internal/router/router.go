@@ -57,6 +57,7 @@ func New(svc *stats.Service, registerSvc *register.Service, sseInterval time.Dur
 	phone := api.Group("/phone-register")
 	phone.GET("/template", registerH.Template)
 	phone.POST("/user/login", registerH.LoginUser)
+	phone.POST("/user/update", registerH.UpdateUser)
 	phone.GET("/users/:user_id/dashboard", registerH.UserDashboard)
 	phone.GET("/users/:user_id/emails", registerH.UserEmails)
 	phone.POST("/user/emails/generate", registerH.GenerateUserEmails)
@@ -67,8 +68,6 @@ func New(svc *stats.Service, registerSvc *register.Service, sseInterval time.Dur
 	phone.POST("/herosms/stop", registerH.StopSession)
 	phone.GET("/herosms/batch/:batch_id", registerH.GetBatch)
 	phone.POST("/herosms/batch/stop", registerH.StopBatch)
-	phone.POST("/email/send", registerH.SendEmail)
-	phone.POST("/email/verify", registerH.VerifyEmail)
 	phone.GET("/session/:session_id", registerH.GetSession)
 
 	if staticDir != "" {

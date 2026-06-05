@@ -69,22 +69,18 @@ func NewEmailClient(workerDomain, token, mailbox string, attempts int, interval 
 	}
 }
 
-// Configured 仅当 worker 域名、token、OTP 邮箱都配置后才启用自动获取。
+// Configured 仅当 worker 域名和 token 配置后才启用自动获取；收件箱按用户动态传入。
 func (c *EmailClient) Configured() bool {
-	return c != nil && c.baseURL != "" && c.token != "" && c.mailbox != ""
+	return c != nil && c.baseURL != "" && c.token != ""
 }
 
-// Mailbox 返回配置的 OTP 收件箱地址。
-func (c *EmailClient) Mailbox() string {
-	if c == nil {
-		return ""
-	}
-	return c.mailbox
+func (c *EmailClient) ConfiguredForMailbox(mailbox string) bool {
+	return c.Configured() && strings.TrimSpace(mailbox) != ""
 }
 
 // LatestEmailID 返回 OTP 邮箱当前最新邮件 id，作为后续轮询的基线（只取 id 更大的新邮件）。
-func (c *EmailClient) LatestEmailID(ctx context.Context) int {
-	items, err := c.fetchMailItems(ctx)
+func (c *EmailClient) LatestEmailIDForMailbox(ctx context.Context, mailbox string) int {
+	items, err := c.fetchMailItems(ctx, strings.TrimSpace(mailbox))
 	if err != nil || len(items) == 0 {
 		return 0
 	}
@@ -94,21 +90,24 @@ func (c *EmailClient) LatestEmailID(ctx context.Context) int {
 // FetchVerificationCode 轮询 OTP 邮箱，返回 id 大于 minID 的新邮件中的验证码。
 // 当 ctx 有 deadline 时会一直轮询到 ctx 结束；没有 deadline 时才使用 attempts 作为兜底上限。
 // stop 返回 true 时立即中止等待。
-func (c *EmailClient) FetchVerificationCode(ctx context.Context, minID int, stop func() bool, progress func(int, error)) (string, error) {
+func (c *EmailClient) FetchVerificationCodeForMailbox(ctx context.Context, mailbox string, minID int, stop func() bool, progress func(int, error)) (string, error) {
 	_, hasDeadline := ctx.Deadline()
 	maxAttempts := c.attempts
 	if hasDeadline {
 		maxAttempts = 0
 	}
-	return c.fetchVerificationCode(ctx, minID, maxAttempts, stop, progress)
+	return c.fetchVerificationCode(ctx, strings.TrimSpace(mailbox), minID, maxAttempts, stop, progress)
 }
 
 // FetchVerificationCodeAttempts 轮询固定次数后返回空验证码，供上层触发重新发送 OTP。
-func (c *EmailClient) FetchVerificationCodeAttempts(ctx context.Context, minID, attempts int, stop func() bool, progress func(int, error)) (string, error) {
-	return c.fetchVerificationCode(ctx, minID, attempts, stop, progress)
+func (c *EmailClient) FetchVerificationCodeAttemptsForMailbox(ctx context.Context, mailbox string, minID, attempts int, stop func() bool, progress func(int, error)) (string, error) {
+	return c.fetchVerificationCode(ctx, strings.TrimSpace(mailbox), minID, attempts, stop, progress)
 }
 
-func (c *EmailClient) fetchVerificationCode(ctx context.Context, minID, attempts int, stop func() bool, progress func(int, error)) (string, error) {
+func (c *EmailClient) fetchVerificationCode(ctx context.Context, mailbox string, minID, attempts int, stop func() bool, progress func(int, error)) (string, error) {
+	if strings.TrimSpace(mailbox) == "" {
+		return "", fmt.Errorf("OTP 邮箱未配置")
+	}
 	for attempt := 1; ; attempt++ {
 		if attempts > 0 && attempt > attempts {
 			return "", nil
@@ -119,7 +118,7 @@ func (c *EmailClient) fetchVerificationCode(ctx context.Context, minID, attempts
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		items, err := c.fetchMailItems(ctx)
+		items, err := c.fetchMailItems(ctx, mailbox)
 		if err == nil {
 			for _, item := range items {
 				itemID := mailItemID(item)
@@ -129,7 +128,7 @@ func (c *EmailClient) fetchVerificationCode(ctx context.Context, minID, attempts
 				if code := extractEmailCode(item); code != "" {
 					return code, nil
 				}
-				detail, detailErr := c.fetchMailDetail(ctx, itemID)
+				detail, detailErr := c.fetchMailDetail(ctx, mailbox, itemID)
 				if detailErr == nil {
 					if code := extractEmailCode(detail); code != "" {
 						return code, nil
@@ -152,8 +151,12 @@ func (c *EmailClient) fetchVerificationCode(ctx context.Context, minID, attempts
 }
 
 // fetchMailItems 拉取 OTP 邮箱邮件列表，按 id 倒序排序。
-func (c *EmailClient) fetchMailItems(ctx context.Context) ([]map[string]any, error) {
-	endpoint := fmt.Sprintf("https://%s/api/emails?mailbox=%s", c.baseURL, url.QueryEscape(c.mailbox))
+func (c *EmailClient) fetchMailItems(ctx context.Context, mailbox string) ([]map[string]any, error) {
+	mailbox = strings.TrimSpace(mailbox)
+	if mailbox == "" {
+		return nil, fmt.Errorf("OTP 邮箱未配置")
+	}
+	endpoint := fmt.Sprintf("https://%s/api/emails?mailbox=%s", c.baseURL, url.QueryEscape(mailbox))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -182,20 +185,24 @@ func (c *EmailClient) fetchMailItems(ctx context.Context) ([]map[string]any, err
 	return items, nil
 }
 
-func (c *EmailClient) fetchMailDetail(ctx context.Context, id int) (map[string]any, error) {
+func (c *EmailClient) fetchMailDetail(ctx context.Context, mailbox string, id int) (map[string]any, error) {
 	if id <= 0 {
 		return nil, fmt.Errorf("email id 无效")
 	}
+	mailbox = strings.TrimSpace(mailbox)
+	if mailbox == "" {
+		return nil, fmt.Errorf("OTP 邮箱未配置")
+	}
 	endpoints := []string{
 		fmt.Sprintf("https://%s/api/email/%d", c.baseURL, id),
-		fmt.Sprintf("https://%s/api/emails/%d?mailbox=%s", c.baseURL, id, url.QueryEscape(c.mailbox)),
-		fmt.Sprintf("https://%s/api/emails/%d?address=%s", c.baseURL, id, url.QueryEscape(c.mailbox)),
+		fmt.Sprintf("https://%s/api/emails/%d?mailbox=%s", c.baseURL, id, url.QueryEscape(mailbox)),
+		fmt.Sprintf("https://%s/api/emails/%d?address=%s", c.baseURL, id, url.QueryEscape(mailbox)),
 		fmt.Sprintf("https://%s/api/emails/%d", c.baseURL, id),
-		fmt.Sprintf("https://%s/api/emails?id=%d&mailbox=%s", c.baseURL, id, url.QueryEscape(c.mailbox)),
-		fmt.Sprintf("https://%s/api/emails?id=%d&address=%s", c.baseURL, id, url.QueryEscape(c.mailbox)),
-		fmt.Sprintf("https://%s/api/email?id=%d&mailbox=%s", c.baseURL, id, url.QueryEscape(c.mailbox)),
-		fmt.Sprintf("https://%s/api/email?id=%d&address=%s", c.baseURL, id, url.QueryEscape(c.mailbox)),
-		fmt.Sprintf("https://%s/api/email/%d?mailbox=%s", c.baseURL, id, url.QueryEscape(c.mailbox)),
+		fmt.Sprintf("https://%s/api/emails?id=%d&mailbox=%s", c.baseURL, id, url.QueryEscape(mailbox)),
+		fmt.Sprintf("https://%s/api/emails?id=%d&address=%s", c.baseURL, id, url.QueryEscape(mailbox)),
+		fmt.Sprintf("https://%s/api/email?id=%d&mailbox=%s", c.baseURL, id, url.QueryEscape(mailbox)),
+		fmt.Sprintf("https://%s/api/email?id=%d&address=%s", c.baseURL, id, url.QueryEscape(mailbox)),
+		fmt.Sprintf("https://%s/api/email/%d?mailbox=%s", c.baseURL, id, url.QueryEscape(mailbox)),
 	}
 	var lastErr error
 	for _, endpoint := range endpoints {

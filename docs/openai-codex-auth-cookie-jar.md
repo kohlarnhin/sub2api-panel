@@ -60,3 +60,9 @@ deleted cookie values like `login_session=null` or `auth_provider=null`.
 The `/oauth/token` request itself is intentionally simple form data and does not
 need the auth cookies. `missing_existing_app_session` usually means the callback
 code was created from a broken or unfinished app session earlier in the flow.
+
+Do not keep full request/response trace logging in committed code. The login
+flow carries passwords, OAuth codes, tokens, cookies, and OTP values. If deep
+diagnostics are needed again, add a short-lived local patch, write it under
+`logs/`, analyze one fresh run, then remove both the trace code and the log file
+before committing.

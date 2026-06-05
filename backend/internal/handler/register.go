@@ -48,14 +48,29 @@ func (h *RegisterHandler) UserDashboard(c *gin.Context) {
 	c.JSON(http.StatusOK, dashboard)
 }
 
+func (h *RegisterHandler) UpdateUser(c *gin.Context) {
+	var payload register.UserUpdateRequest
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	dashboard, err := h.svc.UpdateUser(c.Request.Context(), payload)
+	if err != nil {
+		c.JSON(statusForRegisterError(err), gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, dashboard)
+}
+
 func (h *RegisterHandler) UserEmails(c *gin.Context) {
 	userID, ok := bindInt64Param(c, "user_id")
 	if !ok {
 		return
 	}
 	page := bindIntQuery(c, "page", 1)
-	pageSize := bindIntQuery(c, "page_size", 20)
-	result, err := h.svc.UserEmails(c.Request.Context(), userID, page, pageSize)
+	pageSize := bindIntQuery(c, "page_size", 10)
+	search := c.Query("q")
+	result, err := h.svc.UserEmails(c.Request.Context(), userID, page, pageSize, search)
 	if err != nil {
 		c.JSON(statusForRegisterError(err), gin.H{"error": err.Error()})
 		return
@@ -177,39 +192,6 @@ func (h *RegisterHandler) StopBatch(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, batch)
-}
-
-func (h *RegisterHandler) SendEmail(c *gin.Context) {
-	var payload struct {
-		SessionID string `json:"session_id" binding:"required"`
-	}
-	if err := c.ShouldBindJSON(&payload); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	session, err := h.svc.SendEmailCode(c.Request.Context(), payload.SessionID)
-	if err != nil {
-		c.JSON(statusForRegisterError(err), gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, session)
-}
-
-func (h *RegisterHandler) VerifyEmail(c *gin.Context) {
-	var payload struct {
-		SessionID string `json:"session_id" binding:"required"`
-		Code      string `json:"code" binding:"required"`
-	}
-	if err := c.ShouldBindJSON(&payload); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	session, err := h.svc.VerifyEmailCode(c.Request.Context(), payload.SessionID, payload.Code)
-	if err != nil {
-		c.JSON(statusForRegisterError(err), gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, session)
 }
 
 func statusForRegisterError(err error) int {

@@ -24,10 +24,12 @@ func (r *Repository) EnsureSchema(ctx context.Context) error {
 			username TEXT NOT NULL UNIQUE,
 			group_id BIGINT NOT NULL,
 			is_duck BOOLEAN NOT NULL DEFAULT FALSE,
+			otp_email TEXT NOT NULL DEFAULT '',
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)
 		`,
+		`ALTER TABLE register_users ADD COLUMN IF NOT EXISTS otp_email TEXT NOT NULL DEFAULT ''`,
 		`
 		CREATE TABLE IF NOT EXISTS user_email (
 			id BIGSERIAL PRIMARY KEY,
@@ -80,13 +82,13 @@ func (r *Repository) GetRegisterUserByUsername(ctx context.Context, username str
 		return nil, fmt.Errorf("username 不能为空")
 	}
 	const q = `
-		SELECT id, username, group_id, is_duck, created_at, updated_at
+		SELECT id, username, group_id, is_duck, COALESCE(otp_email, ''), created_at, updated_at
 		FROM register_users
 		WHERE LOWER(username) = LOWER($1)
 		LIMIT 1
 	`
 	var user RegisterUser
-	if err := r.db.QueryRowContext(ctx, q, username).Scan(&user.ID, &user.Username, &user.GroupID, &user.IsDuck, &user.CreatedAt, &user.UpdatedAt); err != nil {
+	if err := r.db.QueryRowContext(ctx, q, username).Scan(&user.ID, &user.Username, &user.GroupID, &user.IsDuck, &user.OTPEmail, &user.CreatedAt, &user.UpdatedAt); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("用户不存在: %s", username)
 		}
@@ -100,17 +102,39 @@ func (r *Repository) GetRegisterUserByID(ctx context.Context, userID int64) (*Re
 		return nil, fmt.Errorf("user_id 无效")
 	}
 	const q = `
-		SELECT id, username, group_id, is_duck, created_at, updated_at
+		SELECT id, username, group_id, is_duck, COALESCE(otp_email, ''), created_at, updated_at
 		FROM register_users
 		WHERE id = $1
 		LIMIT 1
 	`
 	var user RegisterUser
-	if err := r.db.QueryRowContext(ctx, q, userID).Scan(&user.ID, &user.Username, &user.GroupID, &user.IsDuck, &user.CreatedAt, &user.UpdatedAt); err != nil {
+	if err := r.db.QueryRowContext(ctx, q, userID).Scan(&user.ID, &user.Username, &user.GroupID, &user.IsDuck, &user.OTPEmail, &user.CreatedAt, &user.UpdatedAt); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("用户不存在: %d", userID)
 		}
 		return nil, fmt.Errorf("query register_users by id: %w", err)
+	}
+	return &user, nil
+}
+
+func (r *Repository) UpdateRegisterUser(ctx context.Context, userID int64, otpEmail string) (*RegisterUser, error) {
+	if userID <= 0 {
+		return nil, fmt.Errorf("user_id 无效")
+	}
+	otpEmail = strings.TrimSpace(otpEmail)
+	const q = `
+		UPDATE register_users
+		SET otp_email = $2,
+		    updated_at = NOW()
+		WHERE id = $1
+		RETURNING id, username, group_id, is_duck, COALESCE(otp_email, ''), created_at, updated_at
+	`
+	var user RegisterUser
+	if err := r.db.QueryRowContext(ctx, q, userID, otpEmail).Scan(&user.ID, &user.Username, &user.GroupID, &user.IsDuck, &user.OTPEmail, &user.CreatedAt, &user.UpdatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("用户不存在: %d", userID)
+		}
+		return nil, fmt.Errorf("update register_users: %w", err)
 	}
 	return &user, nil
 }
@@ -399,6 +423,34 @@ func (r *Repository) UserSummary(ctx context.Context, userID int64) (UserSummary
 	return summary, nil
 }
 
+func (r *Repository) UserLoginSummary(ctx context.Context, userID int64) (LoginSummary, error) {
+	summary := LoginSummary{}
+	if userID <= 0 {
+		return summary, fmt.Errorf("user_id 无效")
+	}
+	const q = `
+		SELECT
+			COUNT(*) FILTER (WHERE status = 'queued_login'),
+			COUNT(*) FILTER (WHERE status IN ('login_running', 'uploading')),
+			COUNT(*) FILTER (WHERE status = 'success'),
+			COUNT(*) FILTER (WHERE status = 'failed'),
+			COUNT(*) FILTER (WHERE status IN ('queued_login', 'login_running', 'uploading', 'success', 'failed'))
+		FROM user_phone_accounts
+		WHERE user_id = $1
+		  AND status IN ('queued_login', 'login_running', 'uploading', 'success', 'failed')
+	`
+	if err := r.db.QueryRowContext(ctx, q, userID).Scan(
+		&summary.Queued,
+		&summary.Running,
+		&summary.Success,
+		&summary.Failed,
+		&summary.Total,
+	); err != nil {
+		return summary, fmt.Errorf("query user login summary: %w", err)
+	}
+	return summary, nil
+}
+
 func (r *Repository) LatestUserAccounts(ctx context.Context, userID int64, limit int) ([]UserAccount, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 20
@@ -426,7 +478,7 @@ func (r *Repository) LatestUserAccounts(ctx context.Context, userID int64, limit
 	return out, rows.Err()
 }
 
-func (r *Repository) ListUserEmails(ctx context.Context, userID int64, page, pageSize int) (UserEmailListResponse, error) {
+func (r *Repository) ListUserEmails(ctx context.Context, userID int64, page, pageSize int, search string) (UserEmailListResponse, error) {
 	if userID <= 0 {
 		return UserEmailListResponse{}, fmt.Errorf("user_id 无效")
 	}
@@ -434,7 +486,7 @@ func (r *Repository) ListUserEmails(ctx context.Context, userID int64, page, pag
 		page = 1
 	}
 	if pageSize <= 0 {
-		pageSize = 20
+		pageSize = 10
 	}
 	if pageSize > 100 {
 		pageSize = 100
@@ -445,14 +497,42 @@ func (r *Repository) ListUserEmails(ctx context.Context, userID int64, page, pag
 		Page:     page,
 		PageSize: pageSize,
 	}
-	const countQ = `SELECT COUNT(*) FROM user_email WHERE user_id = $1`
-	if err := r.db.QueryRowContext(ctx, countQ, userID).Scan(&resp.Total); err != nil {
+
+	search = strings.TrimSpace(search)
+	phoneSearch := normalizePhoneSearch(search)
+	where := `WHERE e.user_id = $1`
+	args := []any{userID}
+	if search != "" {
+		where += `
+			AND (
+				e.email ILIKE $2
+				OR ($3 <> '' AND regexp_replace(COALESCE(a.phone, ''), '[+()[:space:]-]', '', 'g') ILIKE $4)
+			)
+		`
+		args = append(args, "%"+search+"%", phoneSearch, "%"+phoneSearch+"%")
+	}
+
+	countQ := `
+		SELECT COUNT(*)
+		FROM user_email e
+		LEFT JOIN LATERAL (
+			SELECT phone
+			FROM user_phone_accounts a
+			WHERE a.user_id = e.user_id
+			  AND (a.id = e.account_id OR a.user_email_id = e.id)
+			ORDER BY
+				CASE WHEN a.id = e.account_id THEN 0 ELSE 1 END,
+				a.id DESC
+			LIMIT 1
+		) a ON TRUE
+		` + where
+	if err := r.db.QueryRowContext(ctx, countQ, args...).Scan(&resp.Total); err != nil {
 		return resp, fmt.Errorf("count user emails: %w", err)
 	}
 	if resp.Total > 0 {
 		resp.TotalPages = (resp.Total + pageSize - 1) / pageSize
 	}
-	const q = `
+	q := `
 		SELECT
 			e.id,
 			e.user_id,
@@ -481,11 +561,12 @@ func (r *Repository) ListUserEmails(ctx context.Context, userID int64, page, pag
 				a.id DESC
 			LIMIT 1
 		) a ON TRUE
-		WHERE e.user_id = $1
+		` + where + `
 		ORDER BY e.id DESC
-		LIMIT $2 OFFSET $3
+		LIMIT $` + fmt.Sprint(len(args)+1) + ` OFFSET $` + fmt.Sprint(len(args)+2) + `
 	`
-	rows, err := r.db.QueryContext(ctx, q, userID, pageSize, offset)
+	args = append(args, pageSize, offset)
+	rows, err := r.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return resp, fmt.Errorf("query user emails: %w", err)
 	}
@@ -518,6 +599,11 @@ func (r *Repository) ListUserEmails(ctx context.Context, userID int64, page, pag
 		return resp, err
 	}
 	return resp, nil
+}
+
+func normalizePhoneSearch(value string) string {
+	replacer := strings.NewReplacer("+", "", "(", "", ")", "", " ", "", "-", "")
+	return replacer.Replace(strings.TrimSpace(value))
 }
 
 func (r *Repository) PhoneExists(ctx context.Context, phone string) (bool, error) {
