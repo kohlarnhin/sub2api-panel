@@ -63,12 +63,6 @@ func New(svc *stats.Service, registerSvc *register.Service, sseInterval time.Dur
 	phone.POST("/user/emails/generate", registerH.GenerateUserEmails)
 	phone.POST("/user/register/start", registerH.StartUserRegister)
 	phone.POST("/user/register/stop", registerH.StopUserRegister)
-	phone.POST("/herosms/start", registerH.StartHeroSMS)
-	phone.POST("/herosms/batch/start", registerH.StartHeroSMSBatch)
-	phone.POST("/herosms/stop", registerH.StopSession)
-	phone.GET("/herosms/batch/:batch_id", registerH.GetBatch)
-	phone.POST("/herosms/batch/stop", registerH.StopBatch)
-	phone.GET("/session/:session_id", registerH.GetSession)
 
 	if staticDir != "" {
 		registerStatic(r, staticDir)
