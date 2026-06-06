@@ -231,6 +231,10 @@ type UserRun struct {
 	LoginStartedCount     int          `json:"login_started_count"`
 	LoginSuccessCount     int          `json:"login_success_count"`
 	LoginFailedCount      int          `json:"login_failed_count"`
+	PhoneCodeAttempt      int          `json:"phone_code_attempt"`
+	PhoneCodeMaxAttempts  int          `json:"phone_code_max_attempts"`
+	LoginEmailCodeAttempt int          `json:"login_email_code_attempt"`
+	LoginEmailCodeMax     int          `json:"login_email_code_max"`
 	CurrentSessionID      string       `json:"current_session_id"`
 	CurrentPhone          string       `json:"current_phone"`
 	CurrentAccountID      int64        `json:"current_account_id"`

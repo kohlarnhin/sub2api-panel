@@ -49,6 +49,10 @@ type UserRun = {
   login_started_count: number
   login_success_count: number
   login_failed_count: number
+  phone_code_attempt: number
+  phone_code_max_attempts: number
+  login_email_code_attempt: number
+  login_email_code_max: number
   current_session_id: string
   current_phone: string
   current_account_id: number
@@ -122,6 +126,8 @@ const DUCK_AUTH_STORAGE = 'sub2api-panel:duck-authorization'
 const REGISTER_COUNT_STORAGE = 'sub2api-panel:user-register-count'
 const EMAIL_COUNT_STORAGE = 'sub2api-panel:user-email-count'
 const EMAIL_PAGE_SIZE = 10
+const inputClass =
+  'rounded-md border border-warmgray-200 bg-white text-warmgray-900 transition-colors placeholder:text-warmgray-400 outline-none focus:border-coral-500 focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0'
 
 const emptyEmailList: UserEmailListResponse = {
   items: [],
@@ -315,6 +321,10 @@ export function PhoneRegisterPanel() {
   const userInfoDirty = otpEmail.trim() !== (user?.otp_email || '').trim()
   const phoneProcessed = (run?.phone_success_count ?? 0) + (run?.phone_failure_count ?? 0)
   const phoneProgress = percent(phoneProcessed, run?.target_count ?? 0)
+  const phoneCodeBadge =
+    (run?.phone_code_attempt ?? 0) > 0 && (run?.phone_code_max_attempts ?? 0) > 0
+      ? `获取 ${run?.phone_code_attempt}/${run?.phone_code_max_attempts}`
+      : ''
   const currentLoginDone = (run?.login_success_count ?? 0) + (run?.login_failed_count ?? 0)
   const currentLoginTotal = Math.max(run?.phone_success_count ?? 0, currentLoginDone)
   const currentLoginRunning = run?.current_login_account_id ? 1 : 0
@@ -336,6 +346,10 @@ export function PhoneRegisterPanel() {
         : currentLoginTotal > 0 && currentLoginDone >= currentLoginTotal
           ? 'bg-emerald-50 text-emerald-700 ring-emerald-200'
         : 'bg-warmgray-50 text-warmgray-600 ring-warmgray-200'
+  const loginEmailCodeBadge =
+    (run?.login_email_code_attempt ?? 0) > 0 && (run?.login_email_code_max ?? 0) > 0
+      ? `获取 ${run?.login_email_code_attempt}/${run?.login_email_code_max}`
+      : ''
   const phoneLogs = useMemo(
     () => (run?.logs ?? []).filter((log) => isPhoneStageText(log.message)),
     [run?.logs],
@@ -661,7 +675,7 @@ export function PhoneRegisterPanel() {
           <label className="grid gap-1.5 text-[12px] font-medium text-warmgray-600">
             Username
             <input
-              className="h-11 rounded-md border border-warmgray-200 bg-white px-3 text-[14px] text-warmgray-900 transition-colors focus:border-coral-500"
+              className={`${inputClass} h-11 px-3 text-[14px]`}
               value={username}
               onChange={(event) => setUsername(event.target.value)}
               onKeyDown={(event) => {
@@ -727,7 +741,7 @@ export function PhoneRegisterPanel() {
               <label className="grid gap-1.5 text-[12px] font-medium text-warmgray-600">
                 接收验证码邮箱
                 <input
-                  className="h-10 rounded-md border border-warmgray-200 bg-white px-3 text-[13px] text-warmgray-900 transition-colors focus:border-coral-500"
+                  className={`${inputClass} h-10 px-3 text-[13px]`}
                   type="email"
                   value={otpEmail}
                   onChange={(event) => setOtpEmail(event.target.value)}
@@ -757,7 +771,7 @@ export function PhoneRegisterPanel() {
                 description="Authorization 会缓存在当前浏览器。"
                 side={
                   <input
-                    className="h-9 w-20 rounded-md border border-warmgray-200 bg-white px-2 text-[13px] text-warmgray-900 focus:border-coral-500"
+                    className={`${inputClass} h-9 w-20 px-2 text-[13px]`}
                     type="number"
                     min={1}
                     max={100}
@@ -770,7 +784,7 @@ export function PhoneRegisterPanel() {
                 <label className="grid gap-1.5 text-[12px] font-medium text-warmgray-600">
                   Duck Authorization
                   <input
-                    className="h-10 rounded-md border border-warmgray-200 bg-white px-3 text-[13px] text-warmgray-900 transition-colors focus:border-coral-500"
+                    className={`${inputClass} h-10 px-3 text-[13px]`}
                     type="password"
                     value={duckAuth}
                     onChange={(event) => setDuckAuth(event.target.value)}
@@ -799,7 +813,7 @@ export function PhoneRegisterPanel() {
               description="一个用户同一时间只运行一个手机号注册任务。"
               side={
                 <input
-                  className="h-9 w-20 rounded-md border border-warmgray-200 bg-white px-2 text-[13px] text-warmgray-900 focus:border-coral-500"
+                  className={`${inputClass} h-9 w-20 px-2 text-[13px]`}
                   type="number"
                   min={1}
                   max={100}
@@ -812,7 +826,7 @@ export function PhoneRegisterPanel() {
               <label className="grid gap-1.5 text-[12px] font-medium text-warmgray-600">
                 HeroSMS API Key
                 <input
-                  className="h-10 rounded-md border border-warmgray-200 bg-white px-3 text-[13px] text-warmgray-900 transition-colors focus:border-coral-500"
+                  className={`${inputClass} h-10 px-3 text-[13px]`}
                   type="password"
                   value={apiKey}
                   onChange={(event) => setApiKey(event.target.value)}
@@ -857,6 +871,7 @@ export function PhoneRegisterPanel() {
             value={phoneProgress}
             primary={`${phoneProcessed}/${run?.target_count ?? 0}`}
             detail={`${run?.phone_success_count ?? 0} 成功 / ${run?.phone_failure_count ?? 0} 失败 / 当前 ${run?.current_phone || '-'}`}
+            badge={phoneCodeBadge}
             emptyText={run?.phone_done ? '手机号注册阶段已完成' : '暂无手机号注册任务'}
             logs={phoneLogs}
           />
@@ -867,6 +882,7 @@ export function PhoneRegisterPanel() {
             value={currentLoginProgress}
             primary={`${currentLoginDone}/${currentLoginTotal}`}
             detail={`${currentLoginQueued} 排队 / ${currentLoginRunning} 处理中 / ${run?.login_success_count ?? 0} 成功 / ${run?.login_failed_count ?? 0} 失败`}
+            badge={loginEmailCodeBadge}
             emptyText="暂无登录上传任务"
             logs={loginLogs}
           />
@@ -961,6 +977,7 @@ function StageProgressPanel({
   value,
   primary,
   detail,
+  badge,
   logs,
   emptyText,
 }: {
@@ -970,6 +987,7 @@ function StageProgressPanel({
   value: number
   primary: string
   detail: string
+  badge?: string
   logs: UserRunLog[]
   emptyText: string
 }) {
@@ -981,9 +999,16 @@ function StageProgressPanel({
           <div className="text-[13px] font-semibold text-warmgray-900">{title}</div>
           <div className="mt-1 text-[12px] text-warmgray-500">{detail}</div>
         </div>
-        <span className={`rounded-full px-2.5 py-1 text-[10px] font-semibold ring-1 ring-inset ${tone}`}>
-          {status}
-        </span>
+        <div className="flex shrink-0 items-center gap-2">
+          {badge ? (
+            <span className="num rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold text-warmgray-600 ring-1 ring-inset ring-warmgray-200">
+              {badge}
+            </span>
+          ) : null}
+          <span className={`rounded-full px-2.5 py-1 text-[10px] font-semibold ring-1 ring-inset ${tone}`}>
+            {status}
+          </span>
+        </div>
       </div>
       <div className="num mt-5 text-[30px] font-semibold leading-none tracking-tightish text-warmgray-900">
         {primary}
@@ -1068,7 +1093,7 @@ function EmailTable({
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <input
-              className="h-9 w-[240px] rounded-md border border-warmgray-200 bg-white px-3 text-[13px] text-warmgray-900 transition-colors placeholder:text-warmgray-400 focus:border-coral-500"
+              className={`${inputClass} h-9 w-[240px] px-3 text-[13px]`}
               value={emailSearch}
               onChange={(event) => onSearchChange(event.target.value)}
               onKeyDown={(event) => {

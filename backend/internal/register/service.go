@@ -23,6 +23,7 @@ const (
 	emailOTPResendFetchAttempts = 10
 	heroSMSStatusPollInterval   = 10 * time.Second
 	heroSMSStatusTimeout        = 180 * time.Second
+	heroSMSStatusMaxAttempts    = int(heroSMSStatusTimeout / heroSMSStatusPollInterval)
 	heroSMSNumberRetryInterval  = 10 * time.Second
 	heroSMSCancelDelay          = 180 * time.Second
 	heroSMSCancelRetryInterval  = 15 * time.Second
@@ -558,6 +559,7 @@ func (s *Service) sendEmailCode(ctx context.Context, sessionID string) error {
 					step = fmt.Sprintf("邮箱验证码暂未获取到，继续重试（第 %d 轮，第 %d/%d 次）", round, attempt, emailOTPResendFetchAttempts)
 				}
 			}
+			s.updatePhoneCodeProgress(sessionID, attempt, emailOTPResendFetchAttempts)
 			s.touch(sessionID, statusRunning, step, errText, sendData)
 			s.logUserRunForSession(sessionID, "info", step)
 		})
@@ -575,6 +577,7 @@ func (s *Service) sendEmailCode(ctx context.Context, sessionID string) error {
 			s.logUserRunForSession(sessionID, "info", step)
 			continue
 		}
+		s.updatePhoneCodeProgress(sessionID, 0, 0)
 		if err := s.verifyEmailCodeWithSession(ctx, sessionID, code); err != nil {
 			if ctx.Err() == nil && strings.Contains(err.Error(), "wrong_email_otp_code") {
 				step := fmt.Sprintf("邮箱验证码无效，准备重新发送（第 %d 轮）", round+1)
@@ -647,6 +650,7 @@ func (s *Service) waitLoginEmailOTP(ctx context.Context, sessionID string, authD
 		if fetchErr != nil {
 			errText = fetchErr.Error()
 		}
+		s.updateLoginEmailOTPProgress(sessionID, attempt, emailOTPResendFetchAttempts)
 		s.touch(sessionID, statusRunning, step, errText, authData)
 	})
 	if err != nil || code == "" {
@@ -657,6 +661,7 @@ func (s *Service) waitLoginEmailOTP(ctx context.Context, sessionID string, authD
 		s.touch(sessionID, statusFailed, "登录邮箱验证码自动获取失败，请检查当前用户接收验证码邮箱", errText, authData)
 		return nil
 	}
+	s.updateLoginEmailOTPProgress(sessionID, 0, 0)
 	if err := s.verifyEmailCodeWithSession(ctx, sessionID, code); err != nil {
 		s.touch(sessionID, statusFailed, "自动确认登录邮箱验证码失败，已停止当前账号", err.Error(), authData)
 		return nil
@@ -799,6 +804,8 @@ func (s *Service) runUserRegister(ctx context.Context, user RegisterUser, apiKey
 			run.CurrentSessionID = session.ID
 			run.CurrentPhone = ""
 			run.CurrentAccountID = 0
+			run.PhoneCodeAttempt = 0
+			run.PhoneCodeMaxAttempts = 0
 			run.Step = fmt.Sprintf("正在处理第 %d/%d 个手机号", i, count)
 			run.Logs = appendCappedRunLog(run.Logs, UserRunLog{
 				Time:    time.Now(),
@@ -822,6 +829,8 @@ func (s *Service) runUserRegister(ctx context.Context, user RegisterUser, apiKey
 				run.CurrentSessionID = ""
 				run.CurrentPhone = snapshot.Phone
 				run.CurrentAccountID = snapshot.AccountID
+				run.PhoneCodeAttempt = 0
+				run.PhoneCodeMaxAttempts = 0
 				run.Step = fmt.Sprintf("手机号注册完成 %d/%d，账号 #%d 已进入登录队列", run.PhoneSuccessCount, run.TargetCount, snapshot.AccountID)
 				run.Logs = appendCappedRunLog(run.Logs, UserRunLog{
 					Time:    time.Now(),
@@ -849,6 +858,8 @@ func (s *Service) runUserRegister(ctx context.Context, user RegisterUser, apiKey
 		}
 		s.updateUserRun(user.ID, runID, func(run *userRunState) {
 			run.PhoneFailureCount++
+			run.PhoneCodeAttempt = 0
+			run.PhoneCodeMaxAttempts = 0
 			run.Step = fmt.Sprintf("第 %d 个手机号失败，继续下一个", i)
 			run.Logs = appendCappedRunLog(run.Logs, UserRunLog{
 				Time:    time.Now(),
@@ -911,6 +922,8 @@ func (s *Service) processUserLoginTask(task userLoginTask) {
 	s.updateUserRun(task.UserID, task.RunID, func(run *userRunState) {
 		run.LoginStartedCount++
 		run.CurrentLoginAccountID = task.AccountID
+		run.LoginEmailCodeAttempt = 0
+		run.LoginEmailCodeMax = 0
 		run.Step = fmt.Sprintf("登录队列正在处理账号 #%d", task.AccountID)
 		run.Logs = appendCappedRunLog(run.Logs, UserRunLog{
 			Time:    time.Now(),
@@ -945,6 +958,8 @@ func (s *Service) processUserLoginTask(task userLoginTask) {
 	s.updateUserRun(task.UserID, task.RunID, func(run *userRunState) {
 		run.LoginSuccessCount++
 		run.CurrentLoginAccountID = 0
+		run.LoginEmailCodeAttempt = 0
+		run.LoginEmailCodeMax = 0
 		run.Step = fmt.Sprintf("账号 #%d 登录并上传完成", task.AccountID)
 		run.Logs = appendCappedRunLog(run.Logs, UserRunLog{
 			Time:    time.Now(),
@@ -966,6 +981,8 @@ func (s *Service) failUserLoginTask(task userLoginTask, err error) {
 	s.updateUserRun(task.UserID, task.RunID, func(run *userRunState) {
 		run.LoginFailedCount++
 		run.CurrentLoginAccountID = 0
+		run.LoginEmailCodeAttempt = 0
+		run.LoginEmailCodeMax = 0
 		run.Step = fmt.Sprintf("账号 #%d 登录失败，继续处理队列", task.AccountID)
 		run.Error = errText
 		run.Logs = appendCappedRunLog(run.Logs, UserRunLog{
@@ -1808,6 +1825,7 @@ func (s *Service) waitHeroSMSCode(ctx context.Context, sessionID string, apiKey 
 		if remaining < 0 {
 			remaining = 0
 		}
+		s.updatePhoneCodeProgress(sessionID, pollIndex, heroSMSStatusMaxAttempts)
 		s.touch(sessionID, statusRunning, fmt.Sprintf("等待 HeroSMS 短信验证码（第 %d 次，剩余 %d 秒）", pollIndex, remaining), "", nil)
 		statusData, err := s.heroSMS.GetStatus(ctx, apiKey, activationID)
 		if err != nil {
@@ -1817,6 +1835,7 @@ func (s *Service) waitHeroSMSCode(ctx context.Context, sessionID string, apiKey 
 		s.setLastHeroSMSStatus(sessionID, statusData)
 		s.touch(sessionID, statusRunning, "", "", statusData)
 		if code := ExtractHeroSMSCode(statusData); code != "" {
+			s.updatePhoneCodeProgress(sessionID, 0, 0)
 			return code, nil
 		}
 		if s.sleepWithStop(ctx, sessionID, heroSMSStatusPollInterval) {
@@ -1824,6 +1843,7 @@ func (s *Service) waitHeroSMSCode(ctx context.Context, sessionID string, apiKey 
 			return "", nil
 		}
 	}
+	s.updatePhoneCodeProgress(sessionID, heroSMSStatusMaxAttempts, heroSMSStatusMaxAttempts)
 	s.touch(sessionID, statusRunning, "", "", lastStatus)
 	return "", nil
 }
@@ -2186,6 +2206,28 @@ func (s *Service) logUserRunForSession(sessionID, level, message string) {
 		if message != "" {
 			run.Step = message
 		}
+	})
+}
+
+func (s *Service) updatePhoneCodeProgress(sessionID string, attempt, maxAttempts int) {
+	session := s.publicSession(sessionID)
+	if session == nil || session.UserID <= 0 || session.RunID == "" {
+		return
+	}
+	s.updateUserRun(session.UserID, session.RunID, func(run *userRunState) {
+		run.PhoneCodeAttempt = attempt
+		run.PhoneCodeMaxAttempts = maxAttempts
+	})
+}
+
+func (s *Service) updateLoginEmailOTPProgress(sessionID string, attempt, maxAttempts int) {
+	session := s.publicSession(sessionID)
+	if session == nil || session.UserID <= 0 || session.RunID == "" {
+		return
+	}
+	s.updateUserRun(session.UserID, session.RunID, func(run *userRunState) {
+		run.LoginEmailCodeAttempt = attempt
+		run.LoginEmailCodeMax = maxAttempts
 	})
 }
 

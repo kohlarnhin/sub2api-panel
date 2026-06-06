@@ -31,10 +31,9 @@ body {
 *:focus-visible {
   outline: none !important;
 }
-/* 但保留键盘可达性给真正可交互元素（这里暂时没有） */
+/* 保留键盘可达性给命令型元素；输入框由组件自身的边框变色表达焦点 */
 button:focus-visible,
-a:focus-visible,
-input:focus-visible {
+a:focus-visible {
   outline: 2px solid var(--coral) !important;
   outline-offset: 2px;
 }
