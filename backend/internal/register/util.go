@@ -80,6 +80,23 @@ func int64Value(value any) int64 {
 	}
 }
 
+func boolValue(value any) bool {
+	switch v := value.(type) {
+	case bool:
+		return v
+	case string:
+		parsed, _ := strconv.ParseBool(strings.TrimSpace(v))
+		return parsed
+	default:
+		return false
+	}
+}
+
+func localDayStart(value time.Time) time.Time {
+	local := value.Local()
+	return time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, local.Location())
+}
+
 func isoToEpochSeconds(value string) int64 {
 	text := strings.TrimSpace(value)
 	if text == "" {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 )
 
 type Repository struct {
@@ -172,6 +173,23 @@ func (r *Repository) InsertUserEmail(ctx context.Context, userID int64, email, p
 	}
 	affected, _ := result.RowsAffected()
 	return affected > 0, nil
+}
+
+func (r *Repository) CountUserEmailsCreatedSince(ctx context.Context, userID int64, since time.Time) (int, error) {
+	if userID <= 0 {
+		return 0, fmt.Errorf("user_id 不能为空")
+	}
+	const q = `
+		SELECT COUNT(*)
+		FROM user_email
+		WHERE user_id = $1
+		  AND created_at >= $2
+	`
+	count := 0
+	if err := r.db.QueryRowContext(ctx, q, userID, since).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count user_email created today: %w", err)
+	}
+	return count, nil
 }
 
 func (r *Repository) ClaimUnusedUserEmail(ctx context.Context, userID int64, exclude map[string]struct{}) (*UserEmail, error) {

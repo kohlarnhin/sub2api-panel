@@ -67,6 +67,25 @@ type UserRun = {
   updated_at: string
 }
 
+type UserEmailRun = {
+  user_id: number
+  username: string
+  target: number
+  created: number
+  attempts: number
+  skipped: number
+  failed: number
+  max_attempts: number
+  status: string
+  step: string
+  error: string
+  last_email: string
+  last_error: string
+  logs: UserRunLog[]
+  created_at: string
+  updated_at: string
+}
+
 type UserAccount = {
   id: number
   user_id: number
@@ -84,6 +103,7 @@ type UserDashboard = {
   summary: UserSummary
   login_summary?: LoginSummary
   run?: UserRun
+  email_run?: UserEmailRun
   latest_accounts: UserAccount[]
 }
 
@@ -111,13 +131,19 @@ type UserEmailListResponse = {
 }
 
 type EmailGenerateResult = {
+  target: number
   created: number
+  attempts: number
+  skipped: number
+  failed: number
+  max_attempts: number
   emails: string[]
   errors: string[]
   summary: UserSummary
 }
 
 type EmailRefreshSnapshot = {
+  emailCreated: number
   phoneSuccess: number
   loginSuccess: number
 }
@@ -127,6 +153,7 @@ type CustomSub2APISettings = {
   baseURL: string
   apiKey: string
   groupIDs: string
+  proxyID: string
 }
 
 const AUTHORIZATION_STORAGE = 'sub2api-panel:phone-register-authorization'
@@ -140,6 +167,7 @@ const CUSTOM_SUB2API_ENABLED_STORAGE = 'sub2api-panel:custom-sub2api-enabled'
 const CUSTOM_SUB2API_BASE_URL_STORAGE = 'sub2api-panel:custom-sub2api-base-url'
 const CUSTOM_SUB2API_API_KEY_STORAGE = 'sub2api-panel:custom-sub2api-api-key'
 const CUSTOM_SUB2API_GROUPS_STORAGE = 'sub2api-panel:custom-sub2api-groups'
+const CUSTOM_SUB2API_PROXY_ID_STORAGE = 'sub2api-panel:custom-sub2api-proxy-id'
 const EMAIL_PAGE_SIZE = 10
 const inputClass =
   'rounded-md border border-warmgray-200 bg-white text-warmgray-900 transition-colors placeholder:text-warmgray-400 outline-none focus:border-coral-500 focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0'
@@ -232,8 +260,12 @@ function runIsActive(run?: UserRun) {
   )
 }
 
+function emailRunIsActive(run?: UserEmailRun) {
+  return run?.status === 'running'
+}
+
 function dashboardNeedsRefresh(dashboard: UserDashboard) {
-  return runIsActive(dashboard.run)
+  return runIsActive(dashboard.run) || emailRunIsActive(dashboard.email_run)
 }
 
 function formatTime(value: string) {
@@ -292,6 +324,10 @@ function customSub2APISettingsFor(username?: string): CustomSub2APISettings {
       localStorage.getItem(userKey(CUSTOM_SUB2API_GROUPS_STORAGE)) ||
       localStorage.getItem(CUSTOM_SUB2API_GROUPS_STORAGE) ||
       '',
+    proxyID:
+      localStorage.getItem(userKey(CUSTOM_SUB2API_PROXY_ID_STORAGE)) ||
+      localStorage.getItem(CUSTOM_SUB2API_PROXY_ID_STORAGE) ||
+      '',
   }
 }
 
@@ -318,6 +354,7 @@ function saveCustomSub2APISettings(settings: CustomSub2APISettings, user?: Regis
     [CUSTOM_SUB2API_BASE_URL_STORAGE, settings.baseURL.trim()],
     [CUSTOM_SUB2API_API_KEY_STORAGE, settings.apiKey.trim()],
     [CUSTOM_SUB2API_GROUPS_STORAGE, normalizedGroups],
+    [CUSTOM_SUB2API_PROXY_ID_STORAGE, settings.proxyID.trim()],
   ] as const
   pairs.forEach(([key, value]) => {
     localStorage.setItem(key, value)
@@ -342,6 +379,7 @@ function isLoginStageText(value: string) {
 
 function emailRefreshSnapshot(dashboard: UserDashboard): EmailRefreshSnapshot {
   return {
+    emailCreated: dashboard.email_run?.created ?? 0,
     phoneSuccess: dashboard.run?.phone_success_count ?? 0,
     loginSuccess: Math.max(
       dashboard.run?.login_success_count ?? 0,
@@ -351,7 +389,11 @@ function emailRefreshSnapshot(dashboard: UserDashboard): EmailRefreshSnapshot {
 }
 
 function emailRefreshNeeded(previous: EmailRefreshSnapshot, next: EmailRefreshSnapshot) {
-  return next.phoneSuccess > previous.phoneSuccess || next.loginSuccess > previous.loginSuccess
+  return (
+    next.emailCreated > previous.emailCreated ||
+    next.phoneSuccess > previous.phoneSuccess ||
+    next.loginSuccess > previous.loginSuccess
+  )
 }
 
 function buildEmailURL(userID: number, page: number, query: string) {
@@ -382,6 +424,9 @@ export function PhoneRegisterPanel() {
   const [customSub2APIEnabled, setCustomSub2APIEnabled] = useState(
     () => customSub2APISettingsFor().enabled,
   )
+  const [customSub2APICollapsed, setCustomSub2APICollapsed] = useState(
+    () => !customSub2APISettingsFor().enabled,
+  )
   const [customSub2APIBaseURL, setCustomSub2APIBaseURL] = useState(
     () => customSub2APISettingsFor().baseURL,
   )
@@ -390,6 +435,9 @@ export function PhoneRegisterPanel() {
   )
   const [customSub2APIGroups, setCustomSub2APIGroups] = useState(
     () => customSub2APISettingsFor().groupIDs,
+  )
+  const [customSub2APIProxyID, setCustomSub2APIProxyID] = useState(
+    () => customSub2APISettingsFor().proxyID,
   )
   const [dashboard, setDashboard] = useState<UserDashboard | null>(null)
   // booting：有缓存会话时，先显示加载视图自动恢复，避免切回本页时闪现登录表单。
@@ -409,14 +457,20 @@ export function PhoneRegisterPanel() {
   const timer = useRef<number | null>(null)
   const emailPageRef = useRef(1)
   const emailQueryRef = useRef('')
-  const emailRefreshSnapshotRef = useRef<EmailRefreshSnapshot>({ phoneSuccess: 0, loginSuccess: 0 })
+  const emailRefreshSnapshotRef = useRef<EmailRefreshSnapshot>({
+    emailCreated: 0,
+    phoneSuccess: 0,
+    loginSuccess: 0,
+  })
   const autoLoginRef = useRef(false)
   const dashRef = useRef<HTMLElement | null>(null)
 
   const user = dashboard?.user
   const run = dashboard?.run
+  const emailRun = dashboard?.email_run
   const summary = dashboard?.summary
   const isRunning = runIsActive(run)
+  const isEmailGenerating = emailRunIsActive(emailRun)
   const passwordDirty = newPassword.trim().length > 0
   const userInfoDirty = otpEmail.trim() !== (user?.otp_email || '').trim() || passwordDirty
   const customGroupIDs = useMemo(() => parseGroupIDs(customSub2APIGroups), [customSub2APIGroups])
@@ -621,9 +675,11 @@ export function PhoneRegisterPanel() {
       setEmailCount(localStorage.getItem(userStorageKey(EMAIL_COUNT_STORAGE, data.user)) || '1')
       const customSettings = customSub2APISettingsFor(data.user.username)
       setCustomSub2APIEnabled(customSettings.enabled)
+      setCustomSub2APICollapsed(!customSettings.enabled)
       setCustomSub2APIBaseURL(customSettings.baseURL)
       setCustomSub2APIKey(customSettings.apiKey)
       setCustomSub2APIGroups(customSettings.groupIDs)
+      setCustomSub2APIProxyID(customSettings.proxyID)
       setLoginPassword(password)
       setOtpEmail(data.user.otp_email || '')
       setNewPassword('')
@@ -664,7 +720,7 @@ export function PhoneRegisterPanel() {
 
   const generateEmails = async () => {
     if (!user) return
-    const count = clampCount(emailCount, 100)
+    const count = clampCount(emailCount, 50)
     if (user.is_duck && !duckAuth.trim()) {
       setMessage('请输入 Duck Authorization')
       setMessageType('error')
@@ -674,6 +730,7 @@ export function PhoneRegisterPanel() {
     setMessage(`正在创建 ${count} 个 Duck 邮箱...`)
     setMessageType('info')
     try {
+      scheduleRefresh(user.id)
       localStorage.setItem(EMAIL_COUNT_STORAGE, String(count))
       localStorage.setItem(userStorageKey(EMAIL_COUNT_STORAGE, user), String(count))
       if (user.is_duck) {
@@ -691,17 +748,29 @@ export function PhoneRegisterPanel() {
           }),
         },
       )
-      setDashboard((current) => (current ? { ...current, summary: result.summary } : current))
+      const latestDashboard = await refreshDashboard(user.id, false, true)
+      setDashboard((current) =>
+        current ? { ...current, ...latestDashboard, summary: result.summary } : current,
+      )
       setEmailSearch('')
       setEmailQuery('')
       emailQueryRef.current = ''
-      await refreshDashboard(user.id)
       await refreshEmails(user.id, 1, '')
-      setMessage(`已创建 ${result.created} 个邮箱`)
-      setMessageType(result.created > 0 ? 'ok' : 'info')
+      const failed = result.failed
+      const target = result.target || count
+      const incomplete = result.created < target
+      if (incomplete) {
+        const firstError = result.errors[0] ? `，首个失败原因：${result.errors[0]}` : ''
+        setMessage(`请求创建 ${target} 个新邮箱，已创建 ${result.created} 个，跳过 ${result.skipped} 个，失败 ${failed} 个${firstError}`)
+        setMessageType('error')
+      } else {
+        const failedText = failed > 0 ? `，失败尝试 ${failed} 次` : ''
+        setMessage(`已创建 ${result.created} 个新邮箱，跳过 ${result.skipped} 个已存在邮箱${failedText}`)
+        setMessageType(result.created > 0 ? 'ok' : 'info')
+      }
     } catch (err) {
       renderError(err)
-      void refreshDashboard(user.id).catch(() => undefined)
+      void refreshDashboard(user.id, false, true).catch(() => undefined)
     } finally {
       setLoading(false)
     }
@@ -750,6 +819,7 @@ export function PhoneRegisterPanel() {
         baseURL: customSub2APIBaseURL,
         apiKey: customSub2APIKey,
         groupIDs: customSub2APIGroups,
+        proxyID: customSub2APIProxyID,
       }
       saveCustomSub2APISettings(customSettings, user)
       const data = await requestJSON<UserDashboard>('/api/phone-register/user/register/start', {
@@ -764,6 +834,7 @@ export function PhoneRegisterPanel() {
                 base_url: customSub2APIBaseURL.trim(),
                 api_key: customSub2APIKey.trim(),
                 group_ids: customGroupIDs,
+                proxy_id: customSub2APIProxyID.trim(),
               }
             : { enabled: false },
         }),
@@ -893,7 +964,7 @@ export function PhoneRegisterPanel() {
       setOtpEmail('')
       setNewPassword('')
       setLoginPassword(localStorage.getItem(PASSWORD_STORAGE) || '')
-      emailRefreshSnapshotRef.current = { phoneSuccess: 0, loginSuccess: 0 }
+      emailRefreshSnapshotRef.current = { emailCreated: 0, phoneSuccess: 0, loginSuccess: 0 }
       setMessage('请输入 username 进入注册控制台')
       setMessageType('info')
     }
@@ -958,8 +1029,8 @@ export function PhoneRegisterPanel() {
               className="group flex h-9 items-center gap-1.5 rounded-md border border-warmgray-200 bg-white px-3 text-[12px] font-semibold text-warmgray-600 transition-all hover:border-warmgray-300 hover:bg-warmgray-50 hover:text-warmgray-800 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-white"
               type="button"
               onClick={logout}
-              disabled={loading || isRunning}
-              title={isRunning ? '任务运行中，无法切换用户' : '切换用户'}
+              disabled={loading || isRunning || isEmailGenerating}
+              title={isRunning || isEmailGenerating ? '任务运行中，无法切换用户' : '切换用户'}
             >
               <svg
                 viewBox="0 0 24 24"
@@ -1038,10 +1109,10 @@ export function PhoneRegisterPanel() {
                     className={`${inputClass} h-9 w-20 px-2 text-[13px]`}
                     type="number"
                     min={1}
-                    max={100}
+                    max={50}
                     value={emailCount}
                     onChange={(event) => setEmailCount(event.target.value)}
-                    disabled={loading}
+                    disabled={loading || isEmailGenerating}
                   />
                 }
               >
@@ -1052,7 +1123,7 @@ export function PhoneRegisterPanel() {
                     type="password"
                     value={duckAuth}
                     onChange={(event) => setDuckAuth(event.target.value)}
-                    disabled={loading}
+                    disabled={loading || isEmailGenerating}
                     autoComplete="off"
                     placeholder="不需要输入 Bearer"
                   />
@@ -1061,7 +1132,7 @@ export function PhoneRegisterPanel() {
                   className="mt-3 h-10 w-full rounded-md border border-coral-200 bg-coral-50 px-4 text-[13px] font-semibold text-coral-700 transition-colors hover:bg-coral-100 disabled:cursor-not-allowed disabled:opacity-50"
                   type="button"
                   onClick={() => void generateEmails()}
-                  disabled={loading}
+                  disabled={loading || isEmailGenerating}
                 >
                   创建邮箱
                 </button>
@@ -1071,6 +1142,8 @@ export function PhoneRegisterPanel() {
                 当前用户不是 Duck 邮箱用户，注册时会从 user_email 表中取未使用邮箱。
               </div>
             )}
+
+            {user?.is_duck ? <EmailCreateProgressPanel run={emailRun} /> : null}
 
             <ControlGroup
               title="手机号注册"
@@ -1100,24 +1173,38 @@ export function PhoneRegisterPanel() {
                 />
               </label>
               <div className="mt-3 rounded-xl border border-warmgray-200 bg-white px-3 py-3">
-                <label className="flex items-start gap-3">
-                  <input
-                    className="mt-0.5 h-4 w-4 rounded border-warmgray-300 text-coral-500 focus:ring-coral-500"
-                    type="checkbox"
-                    checked={customSub2APIEnabled}
-                    onChange={(event) => setCustomSub2APIEnabled(event.target.checked)}
-                    disabled={loading || isRunning}
-                  />
-                  <span className="min-w-0">
-                    <span className="block text-[12px] font-semibold text-warmgray-800">
-                      使用自定义 Sub2API
+                <div className="flex items-start justify-between gap-3">
+                  <label className="flex min-w-0 items-start gap-3">
+                    <input
+                      className="mt-0.5 h-4 w-4 rounded border-warmgray-300 text-coral-500 focus:ring-coral-500"
+                      type="checkbox"
+                      checked={customSub2APIEnabled}
+                      onChange={(event) => {
+                        const checked = event.target.checked
+                        setCustomSub2APIEnabled(checked)
+                        setCustomSub2APICollapsed(!checked)
+                      }}
+                      disabled={loading || isRunning}
+                    />
+                    <span className="min-w-0">
+                      <span className="block text-[12px] font-semibold text-warmgray-800">
+                        使用自定义 Sub2API
+                      </span>
+                      <span className="mt-0.5 block text-[11px] leading-4 text-warmgray-500">
+                        开启后使用下方地址、密钥、分组和代理 ID 上传。
+                      </span>
                     </span>
-                    <span className="mt-0.5 block text-[11px] leading-4 text-warmgray-500">
-                      开启后使用下方地址、密钥和分组上传。
-                    </span>
-                  </span>
-                </label>
-                {customSub2APIEnabled ? (
+                  </label>
+                  <button
+                    className="mt-0.5 shrink-0 rounded-full bg-warmgray-50 px-2.5 py-1 text-[10px] font-semibold text-warmgray-500 ring-1 ring-inset ring-warmgray-200 transition-colors hover:bg-warmgray-100 disabled:cursor-not-allowed disabled:opacity-50"
+                    type="button"
+                    onClick={() => setCustomSub2APICollapsed((value) => !value)}
+                    disabled={!customSub2APIEnabled || loading || isRunning}
+                  >
+                    {customSub2APIEnabled && !customSub2APICollapsed ? '收起' : '展开'}
+                  </button>
+                </div>
+                {customSub2APIEnabled && !customSub2APICollapsed ? (
                   <div className="mt-3 grid gap-3">
                     <label className="grid gap-1.5 text-[12px] font-medium text-warmgray-600">
                       Sub2API 地址
@@ -1152,6 +1239,17 @@ export function PhoneRegisterPanel() {
                         disabled={loading || isRunning}
                         autoComplete="off"
                         placeholder="例如 5,8,12"
+                      />
+                    </label>
+                    <label className="grid gap-1.5 text-[12px] font-medium text-warmgray-600">
+                      代理 ID
+                      <input
+                        className={`${inputClass} h-10 px-3 text-[13px]`}
+                        value={customSub2APIProxyID}
+                        onChange={(event) => setCustomSub2APIProxyID(event.target.value)}
+                        disabled={loading || isRunning}
+                        autoComplete="off"
+                        placeholder="可选，留空则不上传 proxy_id"
                       />
                     </label>
                   </div>
@@ -1296,6 +1394,50 @@ function AccountSummaryCard({ summary }: { summary?: UserSummary }) {
         </div>
       </div>
     </article>
+  )
+}
+
+function EmailCreateProgressPanel({ run }: { run?: UserEmailRun }) {
+  const done = run?.created ?? 0
+  const total = run?.target ?? 0
+  const skipped = run?.skipped ?? 0
+  const failed = run?.failed ?? 0
+  const value = percent(done, total)
+  const status = labelForStatus(run?.status || 'idle')
+  const tone = toneForStatus(run?.status || 'idle')
+
+  return (
+    <div className="border-t border-warmgray-100 pt-4">
+      <div className="mb-3 flex items-start justify-between gap-3">
+        <div>
+          <div className="text-[13px] font-semibold text-warmgray-900">邮箱创建进度</div>
+          <div className="mt-1 text-[12px] leading-5 text-warmgray-500">
+            重复 Duck 邮箱会跳过，不计入目标数量。
+          </div>
+        </div>
+        <span className={`shrink-0 rounded-full px-2.5 py-1 text-[10px] font-semibold ring-1 ring-inset ${tone}`}>
+          {status}
+        </span>
+      </div>
+      <div className="rounded-xl border border-warmgray-200 bg-white px-3 py-3">
+        <div className="mb-2 flex items-center justify-between gap-3 text-[12px]">
+          <div className="num font-semibold text-warmgray-800">
+            <AnimatedNumber value={done} format={(v) => String(Math.round(v))} />
+            <span className="text-warmgray-400">/{total}</span>
+          </div>
+          <div className="truncate text-warmgray-500">
+            跳过 {skipped} 个 · 失败 {failed} 次
+          </div>
+        </div>
+        <ProgressMeter value={value} />
+        <div className="mt-2 truncate text-[12px] leading-5 text-warmgray-600">
+          {run?.step || '暂无邮箱创建任务'}
+        </div>
+        {run?.last_error ? (
+          <div className="mt-1 truncate text-[11px] text-rose-600">{run.last_error}</div>
+        ) : null}
+      </div>
+    </div>
   )
 }
 

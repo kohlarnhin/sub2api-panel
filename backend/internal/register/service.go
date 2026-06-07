@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"strings"
 	"sync"
@@ -21,12 +22,15 @@ import (
 const (
 	emailOTPUnavailableMessage  = "邮箱验证码无法自动获取，请检查当前用户接收验证码邮箱和 freemail 配置"
 	emailOTPResendFetchAttempts = 10
+	userEmailDailyCreateLimit   = 50
 	heroSMSStatusPollInterval   = 10 * time.Second
-	heroSMSStatusTimeout        = 180 * time.Second
+	heroSMSStatusTimeout        = 150 * time.Second
+	heroSMSPhoneOTPMaxResends   = 2
 	heroSMSStatusMaxAttempts    = int(heroSMSStatusTimeout / heroSMSStatusPollInterval)
 	heroSMSNumberRetryInterval  = 10 * time.Second
 	heroSMSCancelDelay          = 180 * time.Second
 	heroSMSCancelRetryInterval  = 15 * time.Second
+	heroSMSCancelMaxRetries     = 3
 	maxHeroSMSBatchCount        = 100
 	statusCreated               = "created"
 	statusRunning               = "running"
@@ -59,6 +63,7 @@ type Service struct {
 
 	userMu      sync.RWMutex
 	userRuns    map[int64]*userRunState
+	emailRuns   map[int64]*UserEmailRun
 	loginQueues map[int64]*userLoginQueue
 }
 
@@ -135,6 +140,7 @@ func NewService(repo *Repository, cfg *config.Config, logger *zap.Logger, config
 		cancelTasks:    make(map[string]*heroSMSCancelTask),
 		cancelNotify:   make(chan struct{}, 1),
 		userRuns:       make(map[int64]*userRunState),
+		emailRuns:      make(map[int64]*UserEmailRun),
 		loginQueues:    make(map[int64]*userLoginQueue),
 	}
 }
@@ -179,6 +185,7 @@ func (s *Service) UserDashboard(ctx context.Context, userID int64) (*UserDashboa
 		Summary:        summary,
 		LoginSummary:   loginSummary,
 		Run:            s.publicUserRun(user.ID),
+		EmailRun:       s.publicUserEmailRun(user.ID),
 		LatestAccounts: accounts,
 	}, nil
 }
@@ -220,8 +227,8 @@ func (s *Service) GenerateUserEmails(ctx context.Context, req UserEmailGenerateR
 	if count <= 0 {
 		count = 1
 	}
-	if count > 100 {
-		return nil, fmt.Errorf("单次创建邮箱数量不能超过 100")
+	if count > userEmailDailyCreateLimit {
+		return nil, fmt.Errorf("单次创建邮箱数量不能超过 %d", userEmailDailyCreateLimit)
 	}
 	if !user.IsDuck {
 		return nil, fmt.Errorf("当前用户不是 Duck 邮箱用户，请先在 user_email 表中准备未使用邮箱")
@@ -230,25 +237,70 @@ func (s *Service) GenerateUserEmails(ctx context.Context, req UserEmailGenerateR
 	if auth == "" {
 		return nil, fmt.Errorf("Duck Authorization 不能为空")
 	}
+	if s.isUserEmailRunActive(user.ID) {
+		return nil, fmt.Errorf("当前用户已有邮箱创建任务")
+	}
+	todayCreated, err := s.repo.CountUserEmailsCreatedSince(ctx, user.ID, localDayStart(time.Now()))
+	if err != nil {
+		return nil, err
+	}
+	remainingToday := userEmailDailyCreateLimit - todayCreated
+	if remainingToday <= 0 {
+		return nil, fmt.Errorf("当前用户今天已创建 %d 个邮箱，已达到每日上限 %d 个", todayCreated, userEmailDailyCreateLimit)
+	}
+	if count > remainingToday {
+		count = remainingToday
+	}
 
-	result := &UserEmailGenerateResult{Emails: []string{}, Errors: []string{}}
-	for i := 0; i < count; i++ {
+	maxAttempts := count * 3
+	if maxAttempts < count+20 {
+		maxAttempts = count + 20
+	}
+	result := &UserEmailGenerateResult{Target: count, MaxAttempts: maxAttempts, Emails: []string{}, Errors: []string{}}
+	s.startUserEmailRun(*user, count, maxAttempts)
+	defer func() {
+		s.finishUserEmailRun(user.ID, result)
+	}()
+
+	for result.Created < count && result.Attempts < maxAttempts {
+		if ctx.Err() != nil {
+			errText := ctx.Err().Error()
+			result.Errors = append(result.Errors, errText)
+			s.touchUserEmailRun(user.ID, "", fmt.Sprintf("邮箱创建已中断：%s", errText), "", "", errText)
+			break
+		}
+		result.Attempts++
+		s.updateUserEmailRunProgress(user.ID, result)
+		s.touchUserEmailRun(user.ID, statusRunning, fmt.Sprintf("正在创建 Duck 邮箱 %d/%d（第 %d 次请求）", result.Created+1, count, result.Attempts), "", "", "")
 		email, raw, err := s.duck.CreateEmail(ctx, auth)
 		if err != nil {
 			result.Errors = append(result.Errors, err.Error())
+			result.Failed++
+			s.updateUserEmailRunProgress(user.ID, result)
+			s.touchUserEmailRun(user.ID, statusRunning, "Duck 邮箱创建失败，继续尝试", "", "", err.Error())
 			continue
 		}
 		inserted, err := s.repo.InsertUserEmail(ctx, user.ID, email, "duck", raw)
 		if err != nil {
 			result.Errors = append(result.Errors, err.Error())
+			result.Failed++
+			s.updateUserEmailRunProgress(user.ID, result)
+			s.touchUserEmailRun(user.ID, statusRunning, "Duck 邮箱保存失败，继续尝试", email, "", err.Error())
 			continue
 		}
 		if inserted {
 			result.Created++
 			result.Emails = append(result.Emails, email)
+			s.updateUserEmailRunProgress(user.ID, result)
+			s.touchUserEmailRun(user.ID, statusRunning, fmt.Sprintf("已创建 Duck 邮箱 %d/%d", result.Created, count), email, "", "")
 		} else {
-			result.Errors = append(result.Errors, fmt.Sprintf("邮箱已存在，已跳过: %s", email))
+			result.Skipped++
+			s.updateUserEmailRunProgress(user.ID, result)
+			s.touchUserEmailRun(user.ID, statusRunning, "Duck 邮箱已存在，已跳过并继续创建", email, "", "")
 		}
+	}
+	if result.Created < count && len(result.Errors) == 0 {
+		result.Errors = append(result.Errors, fmt.Sprintf("已达到最大尝试次数 %d，仍缺少 %d 个新邮箱", maxAttempts, count-result.Created))
 	}
 	summary, err := s.repo.UserSummary(ctx, user.ID)
 	if err == nil {
@@ -1117,13 +1169,13 @@ func (s *Service) runHeroSMSAutoRegister(ctx context.Context, sessionID string) 
 					s.logUserRunForSession(sessionID, "warn", fmt.Sprintf("已停止，手机号 %s 当前激活已加入取消队列", phone))
 					return nil
 				}
-				s.touch(sessionID, statusRunning, "3分钟未获取到手机号验证码，已加入取消队列并继续用当前模板重新获取手机号", "", map[string]any{
+				s.touch(sessionID, statusRunning, "2分30秒未获取到手机号验证码，已加入取消队列并继续用当前模板重新获取手机号", "", map[string]any{
 					"activation_id": activationID,
 					"phone":         phone,
-					"message":       "HeroSMS 3分钟未返回验证码",
+					"message":       "HeroSMS 2分30秒未返回验证码",
 					"cancel_queue":  cancelData,
 				})
-				s.logUserRunForSession(sessionID, "warn", fmt.Sprintf("手机号 %s 等待 3 分钟未收到验证码，已加入取消队列，继续重新获取手机号", phone))
+				s.logUserRunForSession(sessionID, "warn", fmt.Sprintf("手机号 %s 等待 2 分 30 秒未收到验证码，已加入取消队列，继续重新获取手机号", phone))
 				return nil
 			}
 			s.touch(sessionID, statusPhoneCodeSent, "已获取手机号验证码，正在自动确认", "", nil)
@@ -1587,7 +1639,11 @@ func (s *Service) finishOrWaitCodex(ctx context.Context, sessionID string, authD
 	}
 	s.mu.Unlock()
 	groupIDs := session.GroupIDs
-	sub2apiJSON := BuildSub2APIPayload(email, tokenData, groupIDs)
+	proxyID := ""
+	if session.sub2api != nil && session.sub2api.Enabled {
+		proxyID = session.sub2api.ProxyID
+	}
+	sub2apiJSON := BuildSub2APIPayload(email, tokenData, groupIDs, proxyID)
 	if session.UserID <= 0 || session.AccountID <= 0 {
 		err := fmt.Errorf("用户会话缺少 user_id 或 account_id")
 		s.touch(sessionID, statusFailed, "用户账号保存失败", err.Error(), authData)
@@ -1667,6 +1723,7 @@ func validateUserRegisterRunOptions(custom *CustomSub2APIConfig) (userRegisterRu
 		BaseURL:  baseURL,
 		APIKey:   apiKey,
 		GroupIDs: groupIDs,
+		ProxyID:  strings.TrimSpace(custom.ProxyID),
 	}
 	return options, nil
 }
@@ -1680,6 +1737,7 @@ func cloneCustomSub2APIConfig(in *CustomSub2APIConfig) *CustomSub2APIConfig {
 		BaseURL:  strings.TrimSpace(in.BaseURL),
 		APIKey:   strings.TrimSpace(in.APIKey),
 		GroupIDs: cloneInt64s(in.GroupIDs),
+		ProxyID:  strings.TrimSpace(in.ProxyID),
 	}
 }
 
@@ -1946,9 +2004,10 @@ func (s *Service) exchangeCallbackForToken(ctx context.Context, sessionID, callb
 func (s *Service) waitHeroSMSCode(ctx context.Context, sessionID string, apiKey string, activationID string) (string, error) {
 	deadline := time.Now().Add(heroSMSStatusTimeout)
 	pollIndex := 0
+	resendCount := 0
 	var lastStatus map[string]any
-	for time.Now().Before(deadline) || time.Now().Equal(deadline) {
-		if s.isSessionStopped(sessionID) || ctx.Err() != nil {
+	for pollIndex < heroSMSStatusMaxAttempts {
+		if s.sleepWithStop(ctx, sessionID, heroSMSStatusPollInterval) {
 			s.touch(sessionID, statusRunning, "已请求停止等待 HeroSMS 短信验证码", "", nil)
 			return "", nil
 		}
@@ -1970,14 +2029,59 @@ func (s *Service) waitHeroSMSCode(ctx context.Context, sessionID string, apiKey 
 			s.updatePhoneCodeProgress(sessionID, 0, 0)
 			return code, nil
 		}
-		if s.sleepWithStop(ctx, sessionID, heroSMSStatusPollInterval) {
-			s.touch(sessionID, statusRunning, "已请求停止等待 HeroSMS 短信验证码", "", nil)
-			return "", nil
+		if shouldResendPhoneOTP(pollIndex) && resendCount < heroSMSPhoneOTPMaxResends {
+			resendCount++
+			step := fmt.Sprintf("第 %d 次获取手机号验证码仍未收到，正在第 %d 次重新发送验证码", pollIndex, resendCount)
+			s.touch(sessionID, statusRunning, step, "", statusData)
+			s.logUserRunForSession(sessionID, "warn", step)
+			resendData, resendErr := s.resendPhoneOTP(ctx, sessionID)
+			if resendErr != nil {
+				errText := resendErr.Error()
+				s.touch(sessionID, statusRunning, "手机号验证码重新发送失败，继续等待原验证码", errText, resendData)
+				s.logUserRunForSession(sessionID, "warn", "手机号验证码重新发送失败，继续等待原验证码："+errText)
+			} else {
+				s.touch(sessionID, statusRunning, "手机号验证码已重新发送，继续等待 HeroSMS 验证码", "", resendData)
+				s.logUserRunForSession(sessionID, "info", "手机号验证码已重新发送，继续等待 HeroSMS 验证码")
+			}
 		}
 	}
 	s.updatePhoneCodeProgress(sessionID, heroSMSStatusMaxAttempts, heroSMSStatusMaxAttempts)
 	s.touch(sessionID, statusRunning, "", "", lastStatus)
 	return "", nil
+}
+
+func shouldResendPhoneOTP(pollIndex int) bool {
+	return pollIndex == 6 || pollIndex == 9
+}
+
+func (s *Service) resendPhoneOTP(ctx context.Context, sessionID string) (map[string]any, error) {
+	session := s.getState(sessionID)
+	if session == nil || session.auth == nil {
+		return nil, fmt.Errorf("手机号注册会话已失效")
+	}
+	const endpoint = "https://auth.openai.com/api/accounts/phone-otp/send"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("referer", "https://auth.openai.com/phone-verification")
+	req.Header.Set("accept", "application/json")
+	applyBrowserHeaders(req.Header)
+	resp, err := session.auth.Client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	data, body, err := responseJSON(resp)
+	if err != nil {
+		return data, err
+	}
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		return data, fmt.Errorf("手机号验证码重新发送失败: %d - %s", resp.StatusCode, truncate(body, 300))
+	}
+	if len(data) > 0 {
+		return data, nil
+	}
+	return map[string]any{"status_code": resp.StatusCode}, nil
 }
 
 // markUserEmailBound 在 user_email 已绑定到账号后，立即把它标记为已用（即使后续 token
@@ -2279,6 +2383,20 @@ func (s *Service) publicUserRun(userID int64) *UserRun {
 	return cloneUserRun(&run.UserRun)
 }
 
+func (s *Service) publicUserEmailRun(userID int64) *UserEmailRun {
+	s.userMu.RLock()
+	defer s.userMu.RUnlock()
+	run := s.emailRuns[userID]
+	return cloneUserEmailRun(run)
+}
+
+func (s *Service) isUserEmailRunActive(userID int64) bool {
+	s.userMu.RLock()
+	defer s.userMu.RUnlock()
+	run := s.emailRuns[userID]
+	return run != nil && run.Status == statusRunning
+}
+
 func cloneUserRun(in *UserRun) *UserRun {
 	if in == nil {
 		return nil
@@ -2286,6 +2404,137 @@ func cloneUserRun(in *UserRun) *UserRun {
 	out := *in
 	out.Logs = append([]UserRunLog(nil), in.Logs...)
 	return &out
+}
+
+func cloneUserEmailRun(in *UserEmailRun) *UserEmailRun {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.Logs = append([]UserRunLog(nil), in.Logs...)
+	return &out
+}
+
+func (s *Service) startUserEmailRun(user RegisterUser, target, maxAttempts int) {
+	now := time.Now()
+	run := &UserEmailRun{
+		UserID:      user.ID,
+		Username:    user.Username,
+		Target:      target,
+		MaxAttempts: maxAttempts,
+		Status:      statusRunning,
+		Step:        fmt.Sprintf("准备创建 %d 个 Duck 邮箱", target),
+		Logs: []UserRunLog{{
+			Time:    now,
+			Level:   "info",
+			Message: fmt.Sprintf("准备创建 %d 个 Duck 邮箱", target),
+		}},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	s.userMu.Lock()
+	s.emailRuns[user.ID] = run
+	s.userMu.Unlock()
+}
+
+func (s *Service) touchUserEmailRun(userID int64, status, step, email, errText, lastError string) {
+	if userID <= 0 {
+		return
+	}
+	s.userMu.Lock()
+	defer s.userMu.Unlock()
+	run := s.emailRuns[userID]
+	if run == nil {
+		return
+	}
+	if status != "" {
+		run.Status = status
+	}
+	if step != "" {
+		run.Step = step
+	}
+	if email != "" {
+		run.LastEmail = email
+	}
+	if lastError != "" {
+		run.LastError = lastError
+	}
+	run.UpdatedAt = time.Now()
+	if step != "" {
+		level := "info"
+		if errText != "" || lastError != "" {
+			level = "warn"
+		}
+		run.Logs = appendCappedRunLog(run.Logs, UserRunLog{
+			Time:    run.UpdatedAt,
+			Level:   level,
+			Message: step,
+		})
+	}
+}
+
+func (s *Service) updateUserEmailRunProgress(userID int64, result *UserEmailGenerateResult) {
+	if userID <= 0 || result == nil {
+		return
+	}
+	s.userMu.Lock()
+	defer s.userMu.Unlock()
+	run := s.emailRuns[userID]
+	if run == nil {
+		return
+	}
+	run.Target = result.Target
+	run.Created = result.Created
+	run.Attempts = result.Attempts
+	run.Skipped = result.Skipped
+	run.Failed = result.Failed
+	run.MaxAttempts = result.MaxAttempts
+	run.UpdatedAt = time.Now()
+}
+
+func (s *Service) finishUserEmailRun(userID int64, result *UserEmailGenerateResult) {
+	if userID <= 0 || result == nil {
+		return
+	}
+	s.userMu.Lock()
+	defer s.userMu.Unlock()
+	run := s.emailRuns[userID]
+	if run == nil {
+		return
+	}
+	run.Created = result.Created
+	run.Attempts = result.Attempts
+	run.Skipped = result.Skipped
+	run.Failed = result.Failed
+	run.MaxAttempts = result.MaxAttempts
+	run.Error = ""
+	run.UpdatedAt = time.Now()
+	switch {
+	case result.Created >= result.Target:
+		run.Status = statusSuccess
+		run.Step = fmt.Sprintf("Duck 邮箱创建完成：%d/%d，跳过 %d 个", result.Created, result.Target, result.Skipped)
+	case result.Created == 0 && len(result.Errors) > 0:
+		run.Status = statusFailed
+		run.Error = result.Errors[0]
+		run.LastError = result.Errors[0]
+		run.Step = "Duck 邮箱创建失败"
+	default:
+		run.Status = statusFailed
+		run.Error = fmt.Sprintf("仅创建 %d/%d 个 Duck 邮箱", result.Created, result.Target)
+		if len(result.Errors) > 0 {
+			run.LastError = result.Errors[0]
+		}
+		run.Step = run.Error
+	}
+	level := "error"
+	if run.Status == statusSuccess {
+		level = "ok"
+	}
+	run.Logs = appendCappedRunLog(run.Logs, UserRunLog{
+		Time:    run.UpdatedAt,
+		Level:   level,
+		Message: run.Step,
+	})
 }
 
 func (s *Service) updateActiveUserSessionsOTPEmail(userID int64, otpEmail string) {
@@ -2492,7 +2741,13 @@ func (s *Service) cancelHeroSMS(apiKey, activationID string) map[string]any {
 			statusCode = heroErr.StatusCode
 		}
 		s.logger.Warn("HeroSMS cancel failed", zap.String("activation_id", activationID), zap.Error(err))
-		return map[string]any{"error": err.Error(), "status_code": statusCode, "activation_id": activationID, "activation_status": 8}
+		return map[string]any{
+			"error":             err.Error(),
+			"status_code":       statusCode,
+			"retryable":         isRetryableHeroSMSCancelError(err),
+			"activation_id":     activationID,
+			"activation_status": 8,
+		}
 	}
 	return data
 }
@@ -2634,12 +2889,15 @@ func (s *Service) runHeroSMSCancelWorker() {
 		result := s.cancelHeroSMS(task.apiKey, task.activationID)
 		if errText := strings.TrimSpace(stringValue(result["error"])); errText != "" {
 			statusCode := int(int64Value(result["status_code"]))
-			if isTerminalHeroSMSCancelStatus(statusCode) {
+			retryable := boolValue(result["retryable"])
+			if !retryable || task.attempts >= heroSMSCancelMaxRetries {
 				s.logger.Warn(
-					"HeroSMS queued cancel failed without retry",
+					"HeroSMS queued cancel failed, treated as done",
 					zap.String("activation_id", task.activationID),
 					zap.String("phone", task.phone),
 					zap.Int("status_code", statusCode),
+					zap.Bool("retryable", retryable),
+					zap.Int("attempts", task.attempts),
 					zap.String("error", errText),
 				)
 				continue
@@ -2728,13 +2986,18 @@ func heroSMSCancelTaskKey(apiKey, activationID string) string {
 	return strings.TrimSpace(apiKey) + "\x00" + strings.TrimSpace(activationID)
 }
 
-func isTerminalHeroSMSCancelStatus(statusCode int) bool {
-	switch statusCode {
-	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusNotFound, http.StatusUnprocessableEntity:
-		return true
-	default:
+func isRetryableHeroSMSCancelError(err error) bool {
+	if err == nil {
 		return false
 	}
+	if _, ok := err.(*HeroSMSError); ok {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
 }
 
 func isPhoneNumberInUseResponse(data map[string]any, err error) bool {

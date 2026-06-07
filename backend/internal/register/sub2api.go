@@ -82,7 +82,7 @@ func (c *Sub2APIClient) Upload(ctx context.Context, payload map[string]any) (map
 	}, nil
 }
 
-func BuildSub2APIPayload(email string, tokenData map[string]any, groupIDs []int64) map[string]any {
+func BuildSub2APIPayload(email string, tokenData map[string]any, groupIDs []int64, proxyID string) map[string]any {
 	idToken := strings.TrimSpace(stringValue(tokenData["id_token"]))
 	claims := decodeJWTPayload(idToken)
 	authClaims, _ := claims["https://api.openai.com/auth"].(map[string]any)
@@ -110,7 +110,7 @@ func BuildSub2APIPayload(email string, tokenData map[string]any, groupIDs []int6
 	))
 	planType := normalizePlanType(firstString(stringValue(tokenData["plan_type"]), stringValue(tokenData["planType"]), defaultPlan))
 	ids := normalizeGroupIDs(groupIDs)
-	return map[string]any{
+	payload := map[string]any{
 		"name":     emailValue,
 		"platform": "openai",
 		"type":     "oauth",
@@ -128,6 +128,10 @@ func BuildSub2APIPayload(email string, tokenData map[string]any, groupIDs []int6
 		"concurrency": 10,
 		"priority":    1,
 	}
+	if proxyID = strings.TrimSpace(proxyID); proxyID != "" {
+		payload["proxy_id"] = proxyID
+	}
+	return payload
 }
 
 func normalizeGroupIDs(values []int64) []int64 {

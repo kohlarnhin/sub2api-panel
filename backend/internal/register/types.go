@@ -64,6 +64,7 @@ type CustomSub2APIConfig struct {
 	BaseURL  string  `json:"base_url"`
 	APIKey   string  `json:"api_key"`
 	GroupIDs []int64 `json:"group_ids"`
+	ProxyID  string  `json:"proxy_id"`
 }
 
 type StopRequest struct {
@@ -264,12 +265,37 @@ type UserDashboard struct {
 	Summary        UserSummary   `json:"summary"`
 	LoginSummary   LoginSummary  `json:"login_summary"`
 	Run            *UserRun      `json:"run,omitempty"`
+	EmailRun       *UserEmailRun `json:"email_run,omitempty"`
 	LatestAccounts []UserAccount `json:"latest_accounts"`
 }
 
 type UserEmailGenerateResult struct {
-	Created int         `json:"created"`
-	Emails  []string    `json:"emails"`
-	Errors  []string    `json:"errors"`
-	Summary UserSummary `json:"summary"`
+	Target      int         `json:"target"`
+	Created     int         `json:"created"`
+	Attempts    int         `json:"attempts"`
+	Skipped     int         `json:"skipped"`
+	Failed      int         `json:"failed"`
+	MaxAttempts int         `json:"max_attempts"`
+	Emails      []string    `json:"emails"`
+	Errors      []string    `json:"errors"`
+	Summary     UserSummary `json:"summary"`
+}
+
+type UserEmailRun struct {
+	UserID      int64        `json:"user_id"`
+	Username    string       `json:"username"`
+	Target      int          `json:"target"`
+	Created     int          `json:"created"`
+	Attempts    int          `json:"attempts"`
+	Skipped     int          `json:"skipped"`
+	Failed      int          `json:"failed"`
+	MaxAttempts int          `json:"max_attempts"`
+	Status      string       `json:"status"`
+	Step        string       `json:"step"`
+	Error       string       `json:"error"`
+	LastEmail   string       `json:"last_email"`
+	LastError   string       `json:"last_error"`
+	Logs        []UserRunLog `json:"logs"`
+	CreatedAt   time.Time    `json:"created_at"`
+	UpdatedAt   time.Time    `json:"updated_at"`
 }
