@@ -140,7 +140,6 @@ const CUSTOM_SUB2API_ENABLED_STORAGE = 'sub2api-panel:custom-sub2api-enabled'
 const CUSTOM_SUB2API_BASE_URL_STORAGE = 'sub2api-panel:custom-sub2api-base-url'
 const CUSTOM_SUB2API_API_KEY_STORAGE = 'sub2api-panel:custom-sub2api-api-key'
 const CUSTOM_SUB2API_GROUPS_STORAGE = 'sub2api-panel:custom-sub2api-groups'
-const DEFAULT_USER_PASSWORD = '5nuEGNrh7h4km5aTAy81'
 const EMAIL_PAGE_SIZE = 10
 const inputClass =
   'rounded-md border border-warmgray-200 bg-white text-warmgray-900 transition-colors placeholder:text-warmgray-400 outline-none focus:border-coral-500 focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0'
@@ -372,7 +371,7 @@ export function PhoneRegisterPanel() {
     () => localStorage.getItem(AUTHORIZATION_STORAGE) || localStorage.getItem(USERNAME_STORAGE) || '',
   )
   const [loginPassword, setLoginPassword] = useState(
-    () => localStorage.getItem(PASSWORD_STORAGE) || DEFAULT_USER_PASSWORD,
+    () => localStorage.getItem(PASSWORD_STORAGE) || '',
   )
   const [apiKey, setApiKey] = useState(() => localStorage.getItem(HERO_KEY_STORAGE) || '')
   const [duckAuth, setDuckAuth] = useState(() => localStorage.getItem(DUCK_AUTH_STORAGE) || '')
@@ -595,7 +594,7 @@ export function PhoneRegisterPanel() {
       nextPassword.trim() ||
       localStorage.getItem(usernameStorageKey(PASSWORD_STORAGE, name)) ||
       localStorage.getItem(PASSWORD_STORAGE) ||
-      DEFAULT_USER_PASSWORD
+      ''
     ).trim()
     if (!password) {
       setMessage('请输入密码')
@@ -653,7 +652,11 @@ export function PhoneRegisterPanel() {
     const cachedPassword =
       localStorage.getItem(usernameStorageKey(PASSWORD_STORAGE, cached)) ||
       localStorage.getItem(PASSWORD_STORAGE) ||
-      DEFAULT_USER_PASSWORD
+      ''
+    if (!cachedPassword.trim()) {
+      setBooting(false)
+      return
+    }
     setUsername(cached)
     setLoginPassword(cachedPassword)
     void login(cached, cachedPassword).finally(() => setBooting(false))
@@ -889,7 +892,7 @@ export function PhoneRegisterPanel() {
       setEmailQuery('')
       setOtpEmail('')
       setNewPassword('')
-      setLoginPassword(localStorage.getItem(PASSWORD_STORAGE) || DEFAULT_USER_PASSWORD)
+      setLoginPassword(localStorage.getItem(PASSWORD_STORAGE) || '')
       emailRefreshSnapshotRef.current = { phoneSuccess: 0, loginSuccess: 0 }
       setMessage('请输入 username 进入注册控制台')
       setMessageType('info')
