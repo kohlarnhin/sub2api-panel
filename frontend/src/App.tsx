@@ -39,30 +39,6 @@ export default function App() {
       <header className="flex shrink-0 flex-wrap items-center justify-between gap-3">
         <Brandmark />
         <div className="flex items-center gap-3">
-          <nav className="flex rounded-lg border border-warmgray-200 bg-white p-1 shadow-soft">
-            <button
-              type="button"
-              className={`h-8 rounded-md px-3 text-[12px] font-semibold transition-colors ${
-                panel === 'stats'
-                  ? 'bg-warmgray-900 text-white'
-                  : 'text-warmgray-600 hover:bg-warmgray-50'
-              }`}
-              onClick={() => navigate('stats')}
-            >
-              统计
-            </button>
-            <button
-              type="button"
-              className={`h-8 rounded-md px-3 text-[12px] font-semibold transition-colors ${
-                panel === 'phone-register'
-                  ? 'bg-warmgray-900 text-white'
-                  : 'text-warmgray-600 hover:bg-warmgray-50'
-              }`}
-              onClick={() => navigate('phone-register')}
-            >
-              手机注册
-            </button>
-          </nav>
           {panel === 'stats' ? (
             <StatusBar
               state={state}
@@ -70,6 +46,35 @@ export default function App() {
               timezone={snapshot?.timezone}
             />
           ) : null}
+          <nav className="relative flex rounded-lg border border-warmgray-200 bg-white p-1 shadow-soft">
+            {/* 滑块指示器：在两个等宽 Tab 之间平滑滑动 */}
+            <span
+              aria-hidden
+              className="absolute inset-y-1 left-1 w-[76px] rounded-md bg-warmgray-900 shadow-soft transition-transform duration-300 ease-out"
+              style={{
+                transform:
+                  panel === 'phone-register' ? 'translateX(100%)' : 'translateX(0)',
+              }}
+            />
+            <button
+              type="button"
+              className={`relative z-10 h-8 w-[76px] rounded-md text-[12px] font-semibold transition-colors duration-300 ${
+                panel === 'stats' ? 'text-white' : 'text-warmgray-600'
+              }`}
+              onClick={() => navigate('stats')}
+            >
+              统计
+            </button>
+            <button
+              type="button"
+              className={`relative z-10 h-8 w-[76px] rounded-md text-[12px] font-semibold transition-colors duration-300 ${
+                panel === 'phone-register' ? 'text-white' : 'text-warmgray-600'
+              }`}
+              onClick={() => navigate('phone-register')}
+            >
+              手机注册
+            </button>
+          </nav>
         </div>
       </header>
 

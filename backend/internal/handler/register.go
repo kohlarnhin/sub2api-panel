@@ -27,7 +27,7 @@ func (h *RegisterHandler) LoginUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	dashboard, err := h.svc.LoginUser(c.Request.Context(), payload.Username)
+	dashboard, err := h.svc.LoginUser(c.Request.Context(), payload)
 	if err != nil {
 		c.JSON(statusForRegisterError(err), gin.H{"error": err.Error()})
 		return

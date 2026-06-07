@@ -3,14 +3,15 @@ package register
 import "time"
 
 const (
-	DefaultHeroSMSService      = "dr"
-	DefaultHeroSMSCountry      = 151
-	DefaultHeroSMSOperator     = "any"
-	DefaultHeroSMSMaxPrice     = 0.03
-	DefaultHeroSMSOwner        = 6
-	DefaultHeroSMSActivation   = 0
-	DefaultHeroSMSAmount       = 1
-	DefaultHeroSMSTemplateName = "智利"
+	DefaultHeroSMSService       = "dr"
+	DefaultHeroSMSCountry       = 151
+	DefaultHeroSMSOperator      = "any"
+	DefaultHeroSMSMaxPrice      = 0.03
+	DefaultHeroSMSOwner         = 6
+	DefaultHeroSMSActivation    = 0
+	DefaultHeroSMSAmount        = 1
+	DefaultHeroSMSTemplateName  = "智利"
+	DefaultRegisterUserPassword = "5nuEGNrh7h4km5aTAy81"
 )
 
 type HeroSMSTemplate struct {
@@ -35,11 +36,14 @@ type StartRequest struct {
 
 type UserLoginRequest struct {
 	Username string `json:"username" binding:"required"`
+	Password string `json:"password" binding:"required"`
 }
 
 type UserUpdateRequest struct {
-	UserID   int64  `json:"user_id" binding:"required"`
-	OTPEmail string `json:"otp_email"`
+	UserID          int64  `json:"user_id" binding:"required"`
+	OTPEmail        string `json:"otp_email"`
+	Password        string `json:"password"`
+	CurrentPassword string `json:"current_password"`
 }
 
 type UserEmailGenerateRequest struct {
@@ -49,9 +53,17 @@ type UserEmailGenerateRequest struct {
 }
 
 type UserRegisterStartRequest struct {
-	UserID int64  `json:"user_id" binding:"required"`
-	APIKey string `json:"api_key" binding:"required"`
-	Count  int    `json:"count"`
+	UserID        int64                `json:"user_id" binding:"required"`
+	APIKey        string               `json:"api_key" binding:"required"`
+	Count         int                  `json:"count"`
+	CustomSub2API *CustomSub2APIConfig `json:"custom_sub2api,omitempty"`
+}
+
+type CustomSub2APIConfig struct {
+	Enabled  bool    `json:"enabled"`
+	BaseURL  string  `json:"base_url"`
+	APIKey   string  `json:"api_key"`
+	GroupIDs []int64 `json:"group_ids"`
 }
 
 type StopRequest struct {
@@ -141,6 +153,7 @@ type RegisterUser struct {
 	GroupID   int64     `json:"group_id"`
 	IsDuck    bool      `json:"is_duck"`
 	OTPEmail  string    `json:"otp_email"`
+	Password  string    `json:"-"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }

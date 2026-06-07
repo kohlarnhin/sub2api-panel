@@ -65,6 +65,7 @@ type Service struct {
 type sessionState struct {
 	Session
 	apiKey         string
+	sub2api        *CustomSub2APIConfig
 	auth           *AuthSession
 	oauthState     string
 	codeVerifier   string
@@ -106,6 +107,10 @@ type userLoginTask struct {
 	AccountID int64
 }
 
+type userRegisterRunOptions struct {
+	Sub2API *CustomSub2APIConfig
+}
+
 type userLoginQueue struct {
 	tasks chan userLoginTask
 }
@@ -138,10 +143,16 @@ func (s *Service) Template() HeroSMSTemplate {
 	return DefaultTemplate()
 }
 
-func (s *Service) LoginUser(ctx context.Context, username string) (*UserDashboard, error) {
-	user, err := s.repo.GetRegisterUserByUsername(ctx, username)
+func (s *Service) LoginUser(ctx context.Context, req UserLoginRequest) (*UserDashboard, error) {
+	user, err := s.repo.GetRegisterUserByUsername(ctx, req.Username)
 	if err != nil {
 		return nil, err
+	}
+	if strings.TrimSpace(req.Password) == "" {
+		return nil, fmt.Errorf("请输入密码")
+	}
+	if user.Password != strings.TrimSpace(req.Password) {
+		return nil, fmt.Errorf("密码错误")
 	}
 	return s.UserDashboard(ctx, user.ID)
 }
@@ -173,7 +184,19 @@ func (s *Service) UserDashboard(ctx context.Context, userID int64) (*UserDashboa
 }
 
 func (s *Service) UpdateUser(ctx context.Context, req UserUpdateRequest) (*UserDashboard, error) {
-	user, err := s.repo.UpdateRegisterUser(ctx, req.UserID, req.OTPEmail)
+	if strings.TrimSpace(req.Password) != "" && len(strings.TrimSpace(req.Password)) < 6 {
+		return nil, fmt.Errorf("密码至少 6 位")
+	}
+	if strings.TrimSpace(req.Password) != "" {
+		user, err := s.repo.GetRegisterUserByID(ctx, req.UserID)
+		if err != nil {
+			return nil, err
+		}
+		if user.Password != strings.TrimSpace(req.CurrentPassword) {
+			return nil, fmt.Errorf("当前密码错误")
+		}
+	}
+	user, err := s.repo.UpdateRegisterUser(ctx, req.UserID, req.OTPEmail, req.Password)
 	if err != nil {
 		return nil, err
 	}
@@ -263,6 +286,10 @@ func (s *Service) StartUserRegister(ctx context.Context, req UserRegisterStartRe
 	if summary.EmailUnused < count {
 		return nil, fmt.Errorf("当前用户未使用邮箱不足：需要 %d 个，当前 %d 个", count, summary.EmailUnused)
 	}
+	options, err := validateUserRegisterRunOptions(req.CustomSub2API)
+	if err != nil {
+		return nil, err
+	}
 
 	runCtx, cancel := context.WithCancel(context.Background())
 	now := time.Now()
@@ -294,7 +321,7 @@ func (s *Service) StartUserRegister(ctx context.Context, req UserRegisterStartRe
 	s.userRuns[user.ID] = run
 	s.userMu.Unlock()
 
-	go s.runUserRegister(runCtx, *user, apiKey, run.ID, count)
+	go s.runUserRegister(runCtx, *user, apiKey, run.ID, count, options)
 	return s.UserDashboard(ctx, user.ID)
 }
 
@@ -694,7 +721,7 @@ func (s *Service) newSession(apiKey string, groupIDs []int64, step string) *sess
 	return state
 }
 
-func (s *Service) newUserSession(apiKey string, user RegisterUser, runID, step string) *sessionState {
+func (s *Service) newUserSession(apiKey string, user RegisterUser, runID, step string, options userRegisterRunOptions) *sessionState {
 	state := s.newSession(apiKey, []int64{user.GroupID}, step)
 	s.mu.Lock()
 	if current := s.sessions[state.ID]; current != nil {
@@ -702,7 +729,12 @@ func (s *Service) newUserSession(apiKey string, user RegisterUser, runID, step s
 		current.UserName = user.Username
 		current.OTPMailbox = strings.TrimSpace(user.OTPEmail)
 		current.RunID = runID
-		current.GroupIDs = normalizeGroupIDs([]int64{user.GroupID})
+		current.sub2api = cloneCustomSub2APIConfig(options.Sub2API)
+		if current.sub2api != nil && current.sub2api.Enabled {
+			current.GroupIDs = normalizeGroupIDs(current.sub2api.GroupIDs)
+		} else {
+			current.GroupIDs = normalizeGroupIDs([]int64{user.GroupID})
+		}
 		current.UpdatedAt = time.Now()
 	}
 	s.mu.Unlock()
@@ -786,7 +818,7 @@ func (s *Service) runBatch(ctx context.Context, batchID string) {
 	}
 }
 
-func (s *Service) runUserRegister(ctx context.Context, user RegisterUser, apiKey, runID string, count int) {
+func (s *Service) runUserRegister(ctx context.Context, user RegisterUser, apiKey, runID string, count int, options userRegisterRunOptions) {
 	defer s.maybeFinishUserRun(user.ID, runID)
 	for i := 1; i <= count; i++ {
 		if ctx.Err() != nil || s.isUserRunStopped(user.ID, runID) {
@@ -799,7 +831,7 @@ func (s *Service) runUserRegister(ctx context.Context, user RegisterUser, apiKey
 			return
 		}
 
-		session := s.newUserSession(apiKey, user, runID, fmt.Sprintf("注册 %d/%d：正在准备 HeroSMS 自动注册", i, count))
+		session := s.newUserSession(apiKey, user, runID, fmt.Sprintf("注册 %d/%d：正在准备 HeroSMS 自动注册", i, count), options)
 		s.updateUserRun(user.ID, runID, func(run *userRunState) {
 			run.CurrentSessionID = session.ID
 			run.CurrentPhone = ""
@@ -919,6 +951,11 @@ func (s *Service) processUserLoginTask(task userLoginTask) {
 		current.UpdatedAt = time.Now()
 	}
 	s.mu.Unlock()
+	groupIDs, customUpload := s.sessionUploadTarget(task.SessionID, user.GroupID)
+	targetText := fmt.Sprintf("默认 Sub2API 分组 %s", formatGroupIDs(groupIDs))
+	if customUpload {
+		targetText = fmt.Sprintf("自定义 Sub2API 分组 %s", formatGroupIDs(groupIDs))
+	}
 	s.updateUserRun(task.UserID, task.RunID, func(run *userRunState) {
 		run.LoginStartedCount++
 		run.CurrentLoginAccountID = task.AccountID
@@ -928,7 +965,7 @@ func (s *Service) processUserLoginTask(task userLoginTask) {
 		run.Logs = appendCappedRunLog(run.Logs, UserRunLog{
 			Time:    time.Now(),
 			Level:   "info",
-			Message: fmt.Sprintf("账号 #%d 开始登录，目标 Sub2API 分组 %d", task.AccountID, user.GroupID),
+			Message: fmt.Sprintf("账号 #%d 开始登录，目标 %s", task.AccountID, targetText),
 		})
 	})
 	_ = s.repo.UpdateUserAccountStatus(ctx, task.AccountID, "login_running", "")
@@ -955,6 +992,11 @@ func (s *Service) processUserLoginTask(task userLoginTask) {
 		s.failUserLoginTask(task, errors.New(firstString(snapshot.Error, snapshot.Step, "Codex 登录未完成")))
 		return
 	}
+	successGroupIDs, successCustomUpload := s.sessionUploadTarget(task.SessionID, user.GroupID)
+	successTargetText := fmt.Sprintf("默认分组 %s", formatGroupIDs(successGroupIDs))
+	if successCustomUpload {
+		successTargetText = fmt.Sprintf("自定义分组 %s", formatGroupIDs(successGroupIDs))
+	}
 	s.updateUserRun(task.UserID, task.RunID, func(run *userRunState) {
 		run.LoginSuccessCount++
 		run.CurrentLoginAccountID = 0
@@ -964,7 +1006,7 @@ func (s *Service) processUserLoginTask(task userLoginTask) {
 		run.Logs = appendCappedRunLog(run.Logs, UserRunLog{
 			Time:    time.Now(),
 			Level:   "ok",
-			Message: fmt.Sprintf("账号 #%d 已绑定邮箱 %s，并上传到分组 %d", task.AccountID, snapshot.Email, user.GroupID),
+			Message: fmt.Sprintf("账号 #%d 已绑定邮箱 %s，并上传到%s", task.AccountID, snapshot.Email, successTargetText),
 		})
 	})
 	s.maybeFinishUserRun(task.UserID, task.RunID)
@@ -1566,7 +1608,7 @@ func (s *Service) finishOrWaitCodex(ctx context.Context, sessionID string, authD
 		return errors.New(errText)
 	}
 	s.setDatabaseResult(sessionID, dbResult)
-	uploadResult, err := s.sub2api.Upload(ctx, sub2apiJSON)
+	uploadResult, err := s.sub2apiClientForSession(session).Upload(ctx, sub2apiJSON)
 	if err != nil {
 		_ = s.repo.UpdateUserAccountStatus(ctx, session.AccountID, statusFailed, err.Error())
 		s.touch(sessionID, statusFailed, "Token 已保存，但上传 Sub2API 失败", err.Error(), authData)
@@ -1582,11 +1624,15 @@ func (s *Service) finishOrWaitCodex(ctx context.Context, sessionID string, authD
 	}
 	s.setDatabaseResult(sessionID, dbResult)
 	s.touchWithSub2API(sessionID, sub2apiJSON)
+	uploadTarget := "用户 Sub2API 分组"
+	if session.sub2api != nil && session.sub2api.Enabled {
+		uploadTarget = "自定义 Sub2API 分组"
+	}
 	s.mu.Lock()
 	if current := s.sessions[sessionID]; current != nil {
 		current.Sub2APIUploadResult = uploadResult
 		current.Status = statusSuccess
-		current.Step = "登录完成，已绑定用户邮箱并上传到用户 Sub2API 分组"
+		current.Step = "登录完成，已绑定用户邮箱并上传到" + uploadTarget
 		current.Error = ""
 		current.RawResponse = cloneMap(authData)
 		current.UpdatedAt = time.Now()
@@ -1594,6 +1640,92 @@ func (s *Service) finishOrWaitCodex(ctx context.Context, sessionID string, authD
 	s.mu.Unlock()
 	s.closeAuthSession(sessionID)
 	return nil
+}
+
+func validateUserRegisterRunOptions(custom *CustomSub2APIConfig) (userRegisterRunOptions, error) {
+	options := userRegisterRunOptions{}
+	if custom == nil || !custom.Enabled {
+		return options, nil
+	}
+	baseURL := strings.TrimSpace(custom.BaseURL)
+	apiKey := strings.TrimSpace(custom.APIKey)
+	if baseURL == "" {
+		return options, fmt.Errorf("自定义 Sub2API 地址不能为空")
+	}
+	if apiKey == "" {
+		return options, fmt.Errorf("自定义 Sub2API 密钥不能为空")
+	}
+	if _, err := normalizeBaseURL(baseURL); err != nil {
+		return options, err
+	}
+	groupIDs := positiveGroupIDs(custom.GroupIDs)
+	if len(groupIDs) == 0 {
+		return options, fmt.Errorf("自定义 Sub2API 分组不能为空")
+	}
+	options.Sub2API = &CustomSub2APIConfig{
+		Enabled:  true,
+		BaseURL:  baseURL,
+		APIKey:   apiKey,
+		GroupIDs: groupIDs,
+	}
+	return options, nil
+}
+
+func cloneCustomSub2APIConfig(in *CustomSub2APIConfig) *CustomSub2APIConfig {
+	if in == nil {
+		return nil
+	}
+	return &CustomSub2APIConfig{
+		Enabled:  in.Enabled,
+		BaseURL:  strings.TrimSpace(in.BaseURL),
+		APIKey:   strings.TrimSpace(in.APIKey),
+		GroupIDs: cloneInt64s(in.GroupIDs),
+	}
+}
+
+func (s *Service) sub2apiClientForSession(session *sessionState) *Sub2APIClient {
+	if session != nil && session.sub2api != nil && session.sub2api.Enabled {
+		return NewSub2APIClient(session.sub2api.BaseURL, session.sub2api.APIKey)
+	}
+	return s.sub2api
+}
+
+func (s *Service) sessionUploadTarget(sessionID string, fallbackGroupID int64) ([]int64, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	session := s.sessions[sessionID]
+	if session != nil && session.sub2api != nil && session.sub2api.Enabled {
+		return normalizeGroupIDs(session.sub2api.GroupIDs), true
+	}
+	if session != nil && len(session.GroupIDs) > 0 {
+		return normalizeGroupIDs(session.GroupIDs), false
+	}
+	return normalizeGroupIDs([]int64{fallbackGroupID}), false
+}
+
+func formatGroupIDs(groupIDs []int64) string {
+	ids := normalizeGroupIDs(groupIDs)
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		parts = append(parts, fmt.Sprintf("#%d", id))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func positiveGroupIDs(values []int64) []int64 {
+	out := make([]int64, 0, len(values))
+	seen := make(map[int64]struct{}, len(values))
+	for _, value := range values {
+		if value <= 0 {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
 
 func (s *Service) completeCodexAuthorization(ctx context.Context, sessionID string, authData map[string]any) (map[string]any, error) {

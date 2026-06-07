@@ -1,5 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
+import gsap from 'gsap'
+import { AnimatedNumber } from '@/components/AnimatedNumber'
+import { useAnimatedWidth, useReStagger } from '@/hooks/useGsap'
 
 type RegisterUser = {
   id: number
@@ -119,12 +122,25 @@ type EmailRefreshSnapshot = {
   loginSuccess: number
 }
 
+type CustomSub2APISettings = {
+  enabled: boolean
+  baseURL: string
+  apiKey: string
+  groupIDs: string
+}
+
 const AUTHORIZATION_STORAGE = 'sub2api-panel:phone-register-authorization'
 const USERNAME_STORAGE = 'sub2api-panel:phone-register-username'
+const PASSWORD_STORAGE = 'sub2api-panel:phone-register-password'
 const HERO_KEY_STORAGE = 'sub2api-panel:herosms-api-key'
 const DUCK_AUTH_STORAGE = 'sub2api-panel:duck-authorization'
 const REGISTER_COUNT_STORAGE = 'sub2api-panel:user-register-count'
 const EMAIL_COUNT_STORAGE = 'sub2api-panel:user-email-count'
+const CUSTOM_SUB2API_ENABLED_STORAGE = 'sub2api-panel:custom-sub2api-enabled'
+const CUSTOM_SUB2API_BASE_URL_STORAGE = 'sub2api-panel:custom-sub2api-base-url'
+const CUSTOM_SUB2API_API_KEY_STORAGE = 'sub2api-panel:custom-sub2api-api-key'
+const CUSTOM_SUB2API_GROUPS_STORAGE = 'sub2api-panel:custom-sub2api-groups'
+const DEFAULT_USER_PASSWORD = '5nuEGNrh7h4km5aTAy81'
 const EMAIL_PAGE_SIZE = 10
 const inputClass =
   'rounded-md border border-warmgray-200 bg-white text-warmgray-900 transition-colors placeholder:text-warmgray-400 outline-none focus:border-coral-500 focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0'
@@ -249,6 +265,69 @@ function userStorageKey(base: string, user?: RegisterUser) {
   return user ? `${base}:${user.username}` : base
 }
 
+function usernameStorageKey(base: string, username: string) {
+  const name = username.trim()
+  return name ? `${base}:${name}` : base
+}
+
+function boolFromStorage(value: string | null) {
+  return value === '1' || value === 'true'
+}
+
+function customSub2APISettingsFor(username?: string): CustomSub2APISettings {
+  const userKey = (base: string) => (username ? usernameStorageKey(base, username) : base)
+  return {
+    enabled: boolFromStorage(
+      localStorage.getItem(userKey(CUSTOM_SUB2API_ENABLED_STORAGE)) ??
+        localStorage.getItem(CUSTOM_SUB2API_ENABLED_STORAGE),
+    ),
+    baseURL:
+      localStorage.getItem(userKey(CUSTOM_SUB2API_BASE_URL_STORAGE)) ||
+      localStorage.getItem(CUSTOM_SUB2API_BASE_URL_STORAGE) ||
+      '',
+    apiKey:
+      localStorage.getItem(userKey(CUSTOM_SUB2API_API_KEY_STORAGE)) ||
+      localStorage.getItem(CUSTOM_SUB2API_API_KEY_STORAGE) ||
+      '',
+    groupIDs:
+      localStorage.getItem(userKey(CUSTOM_SUB2API_GROUPS_STORAGE)) ||
+      localStorage.getItem(CUSTOM_SUB2API_GROUPS_STORAGE) ||
+      '',
+  }
+}
+
+function parseGroupIDs(value: string) {
+  const seen = new Set<number>()
+  const ids: number[] = []
+  value
+    .split(/[\s,，;；]+/)
+    .map((item) => Number.parseInt(item, 10))
+    .filter((item) => Number.isFinite(item) && item > 0)
+    .forEach((item) => {
+      if (seen.has(item)) return
+      seen.add(item)
+      ids.push(item)
+    })
+  return ids
+}
+
+function saveCustomSub2APISettings(settings: CustomSub2APISettings, user?: RegisterUser) {
+  const enabled = settings.enabled ? '1' : '0'
+  const normalizedGroups = parseGroupIDs(settings.groupIDs).join(',')
+  const pairs = [
+    [CUSTOM_SUB2API_ENABLED_STORAGE, enabled],
+    [CUSTOM_SUB2API_BASE_URL_STORAGE, settings.baseURL.trim()],
+    [CUSTOM_SUB2API_API_KEY_STORAGE, settings.apiKey.trim()],
+    [CUSTOM_SUB2API_GROUPS_STORAGE, normalizedGroups],
+  ] as const
+  pairs.forEach(([key, value]) => {
+    localStorage.setItem(key, value)
+    if (user) {
+      localStorage.setItem(userStorageKey(key, user), value)
+    }
+  })
+}
+
 function percent(done: number, total: number) {
   if (!total) return 0
   return Math.min(100, Math.round((done / total) * 100))
@@ -292,18 +371,38 @@ export function PhoneRegisterPanel() {
   const [username, setUsername] = useState(
     () => localStorage.getItem(AUTHORIZATION_STORAGE) || localStorage.getItem(USERNAME_STORAGE) || '',
   )
+  const [loginPassword, setLoginPassword] = useState(
+    () => localStorage.getItem(PASSWORD_STORAGE) || DEFAULT_USER_PASSWORD,
+  )
   const [apiKey, setApiKey] = useState(() => localStorage.getItem(HERO_KEY_STORAGE) || '')
   const [duckAuth, setDuckAuth] = useState(() => localStorage.getItem(DUCK_AUTH_STORAGE) || '')
   const [registerCount, setRegisterCount] = useState(
     () => localStorage.getItem(REGISTER_COUNT_STORAGE) || '1',
   )
   const [emailCount, setEmailCount] = useState(() => localStorage.getItem(EMAIL_COUNT_STORAGE) || '1')
+  const [customSub2APIEnabled, setCustomSub2APIEnabled] = useState(
+    () => customSub2APISettingsFor().enabled,
+  )
+  const [customSub2APIBaseURL, setCustomSub2APIBaseURL] = useState(
+    () => customSub2APISettingsFor().baseURL,
+  )
+  const [customSub2APIKey, setCustomSub2APIKey] = useState(
+    () => customSub2APISettingsFor().apiKey,
+  )
+  const [customSub2APIGroups, setCustomSub2APIGroups] = useState(
+    () => customSub2APISettingsFor().groupIDs,
+  )
   const [dashboard, setDashboard] = useState<UserDashboard | null>(null)
+  // booting：有缓存会话时，先显示加载视图自动恢复，避免切回本页时闪现登录表单。
+  const [booting, setBooting] = useState(
+    () => !!(localStorage.getItem(AUTHORIZATION_STORAGE) || '').trim(),
+  )
   const [emailList, setEmailList] = useState<UserEmailListResponse>(emptyEmailList)
   const [emailPage, setEmailPage] = useState(1)
   const [emailSearch, setEmailSearch] = useState('')
   const [emailQuery, setEmailQuery] = useState('')
   const [otpEmail, setOtpEmail] = useState('')
+  const [newPassword, setNewPassword] = useState('')
   const [emailLoading, setEmailLoading] = useState(false)
   const [message, setMessage] = useState('请输入 username 进入注册控制台')
   const [messageType, setMessageType] = useState<'info' | 'error' | 'ok'>('info')
@@ -313,12 +412,15 @@ export function PhoneRegisterPanel() {
   const emailQueryRef = useRef('')
   const emailRefreshSnapshotRef = useRef<EmailRefreshSnapshot>({ phoneSuccess: 0, loginSuccess: 0 })
   const autoLoginRef = useRef(false)
+  const dashRef = useRef<HTMLElement | null>(null)
 
   const user = dashboard?.user
   const run = dashboard?.run
   const summary = dashboard?.summary
   const isRunning = runIsActive(run)
-  const userInfoDirty = otpEmail.trim() !== (user?.otp_email || '').trim()
+  const passwordDirty = newPassword.trim().length > 0
+  const userInfoDirty = otpEmail.trim() !== (user?.otp_email || '').trim() || passwordDirty
+  const customGroupIDs = useMemo(() => parseGroupIDs(customSub2APIGroups), [customSub2APIGroups])
   const phoneProcessed = (run?.phone_success_count ?? 0) + (run?.phone_failure_count ?? 0)
   const phoneProgress = percent(phoneProcessed, run?.target_count ?? 0)
   const phoneCodeBadge =
@@ -431,10 +533,72 @@ export function PhoneRegisterPanel() {
     setOtpEmail(dashboard?.user.otp_email ?? '')
   }, [dashboard?.user.otp_email])
 
-  const login = async (nextUsername = username) => {
+  useEffect(() => {
+    if (dashboard) return
+    const name = username.trim()
+    if (!name) return
+    const cachedPassword =
+      localStorage.getItem(usernameStorageKey(PASSWORD_STORAGE, name)) ||
+      localStorage.getItem(PASSWORD_STORAGE)
+    if (cachedPassword) {
+      setLoginPassword(cachedPassword)
+    }
+  }, [dashboard, username])
+
+  // 看板入场：登录→看板时用 GSAP timeline 编排侧栏与右侧区域滑入，替代硬切换。
+  // 依赖布尔 showingDashboard（而非 dashboard 本身），确保 2.5s 轮询刷新不会重放动画。
+  // 登录 / 加载视图各自在挂载时自带入场动画（见 EntryForm / EntryLoading）。
+  const showingDashboard = dashboard !== null
+  useLayoutEffect(() => {
+    if (!showingDashboard) return
+    const root = dashRef.current
+    if (!root) return
+    const aside = root.querySelector('[data-enter-aside]')
+    const regions = root.querySelectorAll('[data-enter]')
+    const ctx = gsap.context(() => {
+      const tl = gsap.timeline({ defaults: { ease: 'power3.out' } })
+      if (aside) {
+        tl.fromTo(
+          aside,
+          { autoAlpha: 0, x: -28 },
+          { autoAlpha: 1, x: 0, duration: 0.6, clearProps: 'transform' },
+          0,
+        )
+      }
+      if (regions.length) {
+        tl.fromTo(
+          regions,
+          { autoAlpha: 0, y: 22, scale: 0.985 },
+          {
+            autoAlpha: 1,
+            y: 0,
+            scale: 1,
+            duration: 0.6,
+            stagger: 0.09,
+            clearProps: 'transform',
+          },
+          0.08,
+        )
+      }
+    }, root)
+    return () => ctx.revert()
+  }, [showingDashboard])
+
+  const login = async (nextUsername = username, nextPassword = loginPassword) => {
     const name = nextUsername.trim()
     if (!name) {
       setMessage('请输入 username')
+      setMessageType('error')
+      return
+    }
+    const password = (
+      nextPassword.trim() ||
+      localStorage.getItem(usernameStorageKey(PASSWORD_STORAGE, name)) ||
+      localStorage.getItem(PASSWORD_STORAGE) ||
+      DEFAULT_USER_PASSWORD
+    ).trim()
+    if (!password) {
+      setMessage('请输入密码')
       setMessageType('error')
       return
     }
@@ -442,10 +606,12 @@ export function PhoneRegisterPanel() {
     try {
       const data = await requestJSON<UserDashboard>('/api/phone-register/user/login', {
         method: 'POST',
-        body: JSON.stringify({ username: name }),
+        body: JSON.stringify({ username: name, password }),
       })
       localStorage.setItem(AUTHORIZATION_STORAGE, name)
       localStorage.setItem(USERNAME_STORAGE, name)
+      localStorage.setItem(PASSWORD_STORAGE, password)
+      localStorage.setItem(usernameStorageKey(PASSWORD_STORAGE, name), password)
       setDashboard(data)
       emailRefreshSnapshotRef.current = emailRefreshSnapshot(data)
       setApiKey(localStorage.getItem(userStorageKey(HERO_KEY_STORAGE, data.user)) || '')
@@ -454,7 +620,14 @@ export function PhoneRegisterPanel() {
         localStorage.getItem(userStorageKey(REGISTER_COUNT_STORAGE, data.user)) || '1',
       )
       setEmailCount(localStorage.getItem(userStorageKey(EMAIL_COUNT_STORAGE, data.user)) || '1')
+      const customSettings = customSub2APISettingsFor(data.user.username)
+      setCustomSub2APIEnabled(customSettings.enabled)
+      setCustomSub2APIBaseURL(customSettings.baseURL)
+      setCustomSub2APIKey(customSettings.apiKey)
+      setCustomSub2APIGroups(customSettings.groupIDs)
+      setLoginPassword(password)
       setOtpEmail(data.user.otp_email || '')
+      setNewPassword('')
       setEmailSearch('')
       setEmailQuery('')
       emailQueryRef.current = ''
@@ -472,10 +645,18 @@ export function PhoneRegisterPanel() {
   useEffect(() => {
     if (autoLoginRef.current || dashboard || loading) return
     const cached = localStorage.getItem(AUTHORIZATION_STORAGE) || ''
-    if (!cached.trim()) return
+    if (!cached.trim()) {
+      setBooting(false)
+      return
+    }
     autoLoginRef.current = true
+    const cachedPassword =
+      localStorage.getItem(usernameStorageKey(PASSWORD_STORAGE, cached)) ||
+      localStorage.getItem(PASSWORD_STORAGE) ||
+      DEFAULT_USER_PASSWORD
     setUsername(cached)
-    void login(cached)
+    setLoginPassword(cachedPassword)
+    void login(cached, cachedPassword).finally(() => setBooting(false))
   }, [dashboard, loading])
 
   const generateEmails = async () => {
@@ -536,6 +717,23 @@ export function PhoneRegisterPanel() {
       setMessageType('error')
       return
     }
+    if (customSub2APIEnabled) {
+      if (!customSub2APIBaseURL.trim()) {
+        setMessage('请输入自定义 Sub2API 地址')
+        setMessageType('error')
+        return
+      }
+      if (!customSub2APIKey.trim()) {
+        setMessage('请输入自定义 Sub2API 密钥')
+        setMessageType('error')
+        return
+      }
+      if (customGroupIDs.length === 0) {
+        setMessage('请输入自定义上传分组')
+        setMessageType('error')
+        return
+      }
+    }
     setLoading(true)
     setMessage(`正在启动 ${count} 个账号的注册任务...`)
     setMessageType('info')
@@ -544,13 +742,33 @@ export function PhoneRegisterPanel() {
       localStorage.setItem(REGISTER_COUNT_STORAGE, String(count))
       localStorage.setItem(userStorageKey(HERO_KEY_STORAGE, user), apiKey.trim())
       localStorage.setItem(userStorageKey(REGISTER_COUNT_STORAGE, user), String(count))
+      const customSettings = {
+        enabled: customSub2APIEnabled,
+        baseURL: customSub2APIBaseURL,
+        apiKey: customSub2APIKey,
+        groupIDs: customSub2APIGroups,
+      }
+      saveCustomSub2APISettings(customSettings, user)
       const data = await requestJSON<UserDashboard>('/api/phone-register/user/register/start', {
         method: 'POST',
-        body: JSON.stringify({ user_id: user.id, api_key: apiKey.trim(), count }),
+        body: JSON.stringify({
+          user_id: user.id,
+          api_key: apiKey.trim(),
+          count,
+          custom_sub2api: customSub2APIEnabled
+            ? {
+                enabled: true,
+                base_url: customSub2APIBaseURL.trim(),
+                api_key: customSub2APIKey.trim(),
+                group_ids: customGroupIDs,
+              }
+            : { enabled: false },
+        }),
       })
       setDashboard(data)
       emailRefreshSnapshotRef.current = emailRefreshSnapshot(data)
-      setMessage('任务已启动')
+      setCustomSub2APIGroups(customGroupIDs.join(','))
+      setMessage(customSub2APIEnabled ? '任务已启动，将上传到自定义 Sub2API' : '任务已启动')
       setMessageType('ok')
       scheduleRefresh(user.id)
     } catch (err) {
@@ -613,6 +831,12 @@ export function PhoneRegisterPanel() {
   const saveUserInfo = async () => {
     if (!user) return
     const nextOtpEmail = otpEmail.trim()
+    const nextPassword = newPassword.trim()
+    if (nextPassword && nextPassword.length < 6) {
+      setMessage('新密码至少 6 位')
+      setMessageType('error')
+      return
+    }
     setLoading(true)
     setMessage('正在保存用户信息...')
     setMessageType('info')
@@ -622,10 +846,18 @@ export function PhoneRegisterPanel() {
         body: JSON.stringify({
           user_id: user.id,
           otp_email: nextOtpEmail,
+          password: nextPassword,
+          current_password: nextPassword ? loginPassword.trim() : '',
         }),
       })
       setDashboard(data)
       setOtpEmail(data.user.otp_email || '')
+      if (nextPassword) {
+        localStorage.setItem(PASSWORD_STORAGE, nextPassword)
+        localStorage.setItem(userStorageKey(PASSWORD_STORAGE, data.user), nextPassword)
+        setLoginPassword(nextPassword)
+        setNewPassword('')
+      }
       setMessage('用户信息已保存')
       setMessageType('ok')
     } catch (err) {
@@ -647,61 +879,65 @@ export function PhoneRegisterPanel() {
   }
 
   const logout = () => {
-    clearTimer()
-    localStorage.removeItem(AUTHORIZATION_STORAGE)
-    setDashboard(null)
-    setEmailList(emptyEmailList)
-    setEmailPage(1)
-    setEmailSearch('')
-    setEmailQuery('')
-    setOtpEmail('')
-    emailRefreshSnapshotRef.current = { phoneSuccess: 0, loginSuccess: 0 }
-    setMessage('请输入 username 进入注册控制台')
-    setMessageType('info')
+    const doReset = () => {
+      clearTimer()
+      localStorage.removeItem(AUTHORIZATION_STORAGE)
+      setDashboard(null)
+      setEmailList(emptyEmailList)
+      setEmailPage(1)
+      setEmailSearch('')
+      setEmailQuery('')
+      setOtpEmail('')
+      setNewPassword('')
+      setLoginPassword(localStorage.getItem(PASSWORD_STORAGE) || DEFAULT_USER_PASSWORD)
+      emailRefreshSnapshotRef.current = { phoneSuccess: 0, loginSuccess: 0 }
+      setMessage('请输入 username 进入注册控制台')
+      setMessageType('info')
+    }
+    // 先播放看板淡出，再切回登录视图（登录卡由 EntryForm 挂载时自带入场动画）。
+    const root = dashRef.current
+    if (!root) {
+      doReset()
+      return
+    }
+    gsap.to(root, {
+      autoAlpha: 0,
+      y: 10,
+      scale: 0.985,
+      duration: 0.28,
+      ease: 'power2.in',
+      onComplete: doReset,
+    })
   }
 
   if (!dashboard) {
     return (
-      <main className="grid min-h-0 flex-1 place-items-center overflow-hidden">
-        <section className="w-full max-w-[460px] rounded-xl border border-warmgray-200/70 bg-canvas p-7 shadow-card">
-          <div className="mb-6">
-            <h2 className="text-[20px] font-semibold tracking-tightish text-warmgray-900">
-              手机号注册控制台
-            </h2>
-            <p className="mt-1 text-[13px] text-warmgray-500">
-              输入 username 后进入对应用户的手机号注册、邮箱池和登录上传看板。
-            </p>
-          </div>
-          <label className="grid gap-1.5 text-[12px] font-medium text-warmgray-600">
-            Username
-            <input
-              className={`${inputClass} h-11 px-3 text-[14px]`}
-              value={username}
-              onChange={(event) => setUsername(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') void login()
-              }}
-              autoComplete="off"
-              placeholder="输入 username"
-            />
-          </label>
-          <button
-            className="mt-4 h-11 w-full rounded-md bg-coral-500 px-4 text-[13px] font-semibold text-white transition-colors hover:bg-coral-600 disabled:cursor-not-allowed disabled:opacity-50"
-            type="button"
-            onClick={() => void login()}
-            disabled={loading}
-          >
-            进入
-          </button>
-          <MessageLine message={message} type={messageType} className="mt-3" />
-        </section>
+      <main className="relative grid min-h-0 flex-1 place-items-center overflow-hidden">
+        <EntryBackdrop />
+        {booting ? (
+          <EntryLoading username={username} />
+        ) : (
+          <EntryForm
+            username={username}
+            password={loginPassword}
+            onUsernameChange={setUsername}
+            onPasswordChange={setLoginPassword}
+            onSubmit={() => void login()}
+            loading={loading}
+            message={message}
+            messageType={messageType}
+          />
+        )}
       </main>
     )
   }
 
   return (
-    <main className="grid min-h-0 flex-1 grid-cols-12 gap-4 overflow-hidden">
-      <aside className="col-span-12 flex min-h-0 flex-col rounded-xl border border-warmgray-200/70 bg-canvas shadow-card lg:col-span-4 xl:col-span-3">
+    <main ref={dashRef} className="grid min-h-0 flex-1 grid-cols-12 gap-4 overflow-hidden">
+      <aside
+        data-enter-aside
+        className="col-span-12 flex min-h-0 flex-col rounded-2xl border border-warmgray-200/70 bg-canvas shadow-card lg:col-span-4 xl:col-span-3"
+      >
         <div className="shrink-0 border-b border-warmgray-100 px-5 py-4">
           <div className="flex items-start justify-between gap-4">
             <div className="min-w-0">
@@ -716,11 +952,24 @@ export function PhoneRegisterPanel() {
               </p>
             </div>
             <button
-              className="h-9 rounded-md border border-warmgray-200 bg-white px-3 text-[12px] font-semibold text-warmgray-600 transition-colors hover:bg-warmgray-50 disabled:cursor-not-allowed disabled:opacity-50"
+              className="group flex h-9 items-center gap-1.5 rounded-md border border-warmgray-200 bg-white px-3 text-[12px] font-semibold text-warmgray-600 transition-all hover:border-warmgray-300 hover:bg-warmgray-50 hover:text-warmgray-800 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-white"
               type="button"
               onClick={logout}
               disabled={loading || isRunning}
+              title={isRunning ? '任务运行中，无法切换用户' : '切换用户'}
             >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth={2}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                className="h-3.5 w-3.5 transition-transform duration-300 group-hover:rotate-180"
+              >
+                <path d="M7 16V4m0 0L3.5 7.5M7 4l3.5 3.5" />
+                <path d="M17 8v12m0 0l3.5-3.5M17 20l-3.5-3.5" />
+              </svg>
               切换
             </button>
           </div>
@@ -729,9 +978,9 @@ export function PhoneRegisterPanel() {
         <div className="min-h-0 flex-1 overflow-auto px-5 py-4">
           <div className="grid gap-5">
             <div className="grid grid-cols-3 gap-2">
-              <MiniStat label="可用邮箱" value={String(summary?.email_unused ?? 0)} />
-              <MiniStat label="成功账号" value={String(summary?.account_success ?? 0)} />
-              <MiniStat label="失败账号" value={String(summary?.account_failed ?? 0)} />
+              <MiniStat label="可用邮箱" value={summary?.email_unused ?? 0} />
+              <MiniStat label="成功账号" value={summary?.account_success ?? 0} />
+              <MiniStat label="失败账号" value={summary?.account_failed ?? 0} />
             </div>
 
             <ControlGroup
@@ -748,6 +997,18 @@ export function PhoneRegisterPanel() {
                   disabled={loading}
                   autoComplete="off"
                   placeholder="例如 user-otp@example.com"
+                />
+              </label>
+              <label className="mt-3 grid gap-1.5 text-[12px] font-medium text-warmgray-600">
+                新登录密码
+                <input
+                  className={`${inputClass} h-10 px-3 text-[13px]`}
+                  type="password"
+                  value={newPassword}
+                  onChange={(event) => setNewPassword(event.target.value)}
+                  disabled={loading}
+                  autoComplete="new-password"
+                  placeholder="留空则不修改"
                 />
               </label>
               <button
@@ -835,6 +1096,64 @@ export function PhoneRegisterPanel() {
                   placeholder="不同使用者可各自缓存"
                 />
               </label>
+              <div className="mt-3 rounded-xl border border-warmgray-200 bg-white px-3 py-3">
+                <label className="flex items-start gap-3">
+                  <input
+                    className="mt-0.5 h-4 w-4 rounded border-warmgray-300 text-coral-500 focus:ring-coral-500"
+                    type="checkbox"
+                    checked={customSub2APIEnabled}
+                    onChange={(event) => setCustomSub2APIEnabled(event.target.checked)}
+                    disabled={loading || isRunning}
+                  />
+                  <span className="min-w-0">
+                    <span className="block text-[12px] font-semibold text-warmgray-800">
+                      使用自定义 Sub2API
+                    </span>
+                    <span className="mt-0.5 block text-[11px] leading-4 text-warmgray-500">
+                      开启后使用下方地址、密钥和分组上传。
+                    </span>
+                  </span>
+                </label>
+                {customSub2APIEnabled ? (
+                  <div className="mt-3 grid gap-3">
+                    <label className="grid gap-1.5 text-[12px] font-medium text-warmgray-600">
+                      Sub2API 地址
+                      <input
+                        className={`${inputClass} h-10 px-3 text-[13px]`}
+                        type="url"
+                        value={customSub2APIBaseURL}
+                        onChange={(event) => setCustomSub2APIBaseURL(event.target.value)}
+                        disabled={loading || isRunning}
+                        autoComplete="off"
+                        placeholder="https://sub2api.example.com"
+                      />
+                    </label>
+                    <label className="grid gap-1.5 text-[12px] font-medium text-warmgray-600">
+                      Sub2API 密钥
+                      <input
+                        className={`${inputClass} h-10 px-3 text-[13px]`}
+                        type="password"
+                        value={customSub2APIKey}
+                        onChange={(event) => setCustomSub2APIKey(event.target.value)}
+                        disabled={loading || isRunning}
+                        autoComplete="off"
+                        placeholder="自定义 x-api-key"
+                      />
+                    </label>
+                    <label className="grid gap-1.5 text-[12px] font-medium text-warmgray-600">
+                      上传分组
+                      <input
+                        className={`${inputClass} h-10 px-3 text-[13px]`}
+                        value={customSub2APIGroups}
+                        onChange={(event) => setCustomSub2APIGroups(event.target.value)}
+                        disabled={loading || isRunning}
+                        autoComplete="off"
+                        placeholder="例如 5,8,12"
+                      />
+                    </label>
+                  </div>
+                ) : null}
+              </div>
               <div className="mt-3 flex gap-2">
                 <button
                   className="h-10 flex-1 rounded-md bg-coral-500 px-4 text-[13px] font-semibold text-white transition-colors hover:bg-coral-600 disabled:cursor-not-allowed disabled:opacity-50"
@@ -869,7 +1188,8 @@ export function PhoneRegisterPanel() {
             status={labelForStatus(run?.phone_done ? 'success' : run?.status || 'idle')}
             tone={toneForStatus(run?.phone_done ? 'success' : run?.status || 'idle')}
             value={phoneProgress}
-            primary={`${phoneProcessed}/${run?.target_count ?? 0}`}
+            done={phoneProcessed}
+            total={run?.target_count ?? 0}
             detail={`${run?.phone_success_count ?? 0} 成功 / ${run?.phone_failure_count ?? 0} 失败 / 当前 ${run?.current_phone || '-'}`}
             badge={phoneCodeBadge}
             emptyText={run?.phone_done ? '手机号注册阶段已完成' : '暂无手机号注册任务'}
@@ -880,7 +1200,8 @@ export function PhoneRegisterPanel() {
             status={currentLoginStatus}
             tone={currentLoginTone}
             value={currentLoginProgress}
-            primary={`${currentLoginDone}/${currentLoginTotal}`}
+            done={currentLoginDone}
+            total={currentLoginTotal}
             detail={`${currentLoginQueued} 排队 / ${currentLoginRunning} 处理中 / ${run?.login_success_count ?? 0} 成功 / ${run?.login_failed_count ?? 0} 失败`}
             badge={loginEmailCodeBadge}
             emptyText="暂无登录上传任务"
@@ -905,11 +1226,13 @@ export function PhoneRegisterPanel() {
   )
 }
 
-function MiniStat({ label, value }: { label: string; value: string }) {
+function MiniStat({ label, value }: { label: string; value: number }) {
   return (
-    <div className="rounded-lg border border-warmgray-200 bg-white px-3 py-3">
+    <div className="rounded-xl border border-warmgray-200 bg-white px-3 py-3">
       <div className="label">{label}</div>
-      <div className="num mt-1 truncate text-[18px] font-semibold text-warmgray-900">{value}</div>
+      <div className="num mt-1 truncate text-[18px] font-semibold text-warmgray-900">
+        <AnimatedNumber value={value} format={(v) => String(Math.round(v))} />
+      </div>
     </div>
   )
 }
@@ -949,7 +1272,10 @@ function AccountSummaryCard({ summary }: { summary?: UserSummary }) {
     ['失败账号', summary?.account_failed ?? 0],
   ] as const
   return (
-    <article className="rounded-xl border border-warmgray-200/70 bg-canvas px-5 py-4 shadow-card">
+    <article
+      data-enter
+      className="rounded-2xl border border-warmgray-200/70 bg-canvas px-5 py-4 shadow-card"
+    >
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div className="shrink-0">
           <div className="text-[13px] font-semibold text-warmgray-900">当前用户账号统计</div>
@@ -960,7 +1286,7 @@ function AccountSummaryCard({ summary }: { summary?: UserSummary }) {
             <div key={label} className="min-w-[76px]">
               <div className="label">{label}</div>
               <div className="num mt-1 text-[20px] font-semibold leading-none text-warmgray-900">
-                {value}
+                <AnimatedNumber value={value} format={(v) => String(Math.round(v))} />
               </div>
             </div>
           ))}
@@ -975,7 +1301,8 @@ function StageProgressPanel({
   status,
   tone,
   value,
-  primary,
+  done,
+  total,
   detail,
   badge,
   logs,
@@ -985,7 +1312,8 @@ function StageProgressPanel({
   status: string
   tone: string
   value: number
-  primary: string
+  done: number
+  total: number
   detail: string
   badge?: string
   logs: UserRunLog[]
@@ -993,7 +1321,10 @@ function StageProgressPanel({
 }) {
   const visibleLogs = logs.slice(-6)
   return (
-    <article className="rounded-xl border border-warmgray-200/70 bg-canvas px-5 py-4 shadow-card">
+    <article
+      data-enter
+      className="rounded-2xl border border-warmgray-200/70 bg-canvas px-5 py-4 shadow-card"
+    >
       <div className="flex items-start justify-between gap-3">
         <div>
           <div className="text-[13px] font-semibold text-warmgray-900">{title}</div>
@@ -1011,7 +1342,8 @@ function StageProgressPanel({
         </div>
       </div>
       <div className="num mt-5 text-[30px] font-semibold leading-none tracking-tightish text-warmgray-900">
-        {primary}
+        <AnimatedNumber value={done} format={(v) => String(Math.round(v))} />
+        <span className="text-warmgray-400">/{total}</span>
       </div>
       <ProgressMeter value={value} className="mt-4" />
       <div className="mt-4 h-[168px] overflow-hidden rounded-lg bg-warmgray-50 px-3 py-2">
@@ -1036,17 +1368,17 @@ function StageProgressPanel({
 }
 
 function ProgressMeter({ value, className = '' }: { value: number; className?: string }) {
+  const barRef = useAnimatedWidth<HTMLDivElement>(value, { duration: 0.8, ease: 'power3.out' })
   return (
     <div className={className}>
       <div className="mb-1.5 flex items-center justify-between text-[11px] text-warmgray-500">
         <span>进度</span>
-        <span className="num">{value}%</span>
+        <span className="num">
+          <AnimatedNumber value={value} format={(v) => `${Math.round(v)}%`} duration={0.8} />
+        </span>
       </div>
       <div className="h-2.5 overflow-hidden rounded-full bg-warmgray-100">
-        <div
-          className="h-full rounded-full bg-coral-500 transition-all"
-          style={{ width: `${value}%` }}
-        />
+        <div ref={barRef} className="h-full rounded-full bg-coral-500" />
       </div>
     </div>
   )
@@ -1078,9 +1410,20 @@ function EmailTable({
   const maxPage = Math.max(1, emailList.total_pages || 1)
   const start = emailList.total ? (emailList.page - 1) * emailList.page_size + 1 : 0
   const end = emailList.total ? Math.min(emailList.page * emailList.page_size, emailList.total) : 0
+  // 仅在翻页/搜索时重放行错峰；轮询刷新同页（trigger 不变）不会抖动。
+  const rowsRef = useReStagger<HTMLTableSectionElement>(`${emailPage}|${emailQuery}`, {
+    selector: '[data-email-row]',
+    distance: 8,
+    duration: 0.4,
+    stagger: 0.03,
+    delay: 0.1,
+  })
 
   return (
-    <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-warmgray-200/70 bg-canvas shadow-card">
+    <section
+      data-enter
+      className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-warmgray-200/70 bg-canvas shadow-card"
+    >
       <div className="shrink-0 border-b border-warmgray-100 px-5 py-4">
         <div className="flex flex-wrap items-end justify-between gap-3">
           <div>
@@ -1147,12 +1490,16 @@ function EmailTable({
               <th className="border-b border-warmgray-100 px-5 py-2 font-semibold">使用时间</th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-warmgray-100">
+          <tbody ref={rowsRef} className="divide-y divide-warmgray-100">
             {emailList.items.length ? (
               emailList.items.map((item) => {
                 const status = item.account_status || (item.used_at ? 'used' : 'unused')
                 return (
-                  <tr key={item.id} className="text-[12px] text-warmgray-700 transition-colors hover:bg-cream/60">
+                  <tr
+                    key={item.id}
+                    data-email-row
+                    className="text-[12px] text-warmgray-700 transition-colors hover:bg-cream/60"
+                  >
                     <td className="px-5 py-3">
                       <div className="truncate font-semibold text-warmgray-900">{item.email}</div>
                       <div className="mt-1 truncate text-[11px] text-warmgray-400">
@@ -1255,6 +1602,248 @@ function MessageLine({
       } ${className}`}
     >
       {message}
+    </div>
+  )
+}
+
+function PhoneMark({ className = 'h-[18px] w-[18px]' }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+    >
+      <rect x="7" y="3" width="10" height="18" rx="2.5" />
+      <path d="M11 18h2" />
+    </svg>
+  )
+}
+
+function Spinner({ className = 'h-4 w-4' }: { className?: string }) {
+  return (
+    <svg className={`${className} animate-spin`} viewBox="0 0 24 24" fill="none">
+      <circle className="opacity-30" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth={3} />
+      <path
+        className="opacity-90"
+        d="M12 2a10 10 0 0 1 10 10"
+        stroke="currentColor"
+        strokeWidth={3}
+        strokeLinecap="round"
+      />
+    </svg>
+  )
+}
+
+// EntryBackdrop — 入口视图的环境光晕背景：几枚模糊暖色光斑缓慢漂浮（repeatRefresh 让每轮重取随机目标）。
+function EntryBackdrop() {
+  const ref = useRef<HTMLDivElement>(null)
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const ctx = gsap.context(() => {
+      gsap.from(el, { autoAlpha: 0, duration: 1.2, ease: 'power2.out' })
+      gsap.to('[data-orb]', {
+        xPercent: 'random(-15, 15)',
+        yPercent: 'random(-15, 15)',
+        scale: 'random(0.9, 1.15)',
+        duration: 9,
+        ease: 'sine.inOut',
+        repeat: -1,
+        yoyo: true,
+        repeatRefresh: true,
+        stagger: { each: 0.6, from: 'random' },
+      })
+    }, el)
+    return () => ctx.revert()
+  }, [])
+  return (
+    <div ref={ref} aria-hidden className="pointer-events-none absolute inset-0 overflow-hidden">
+      <div data-orb className="absolute -left-20 top-2 h-72 w-72 rounded-full bg-coral-200/45 blur-3xl" />
+      <div data-orb className="absolute -right-12 top-1/4 h-80 w-80 rounded-full bg-amber-100/55 blur-3xl" />
+      <div data-orb className="absolute -bottom-12 left-1/3 h-64 w-64 rounded-full bg-coral-100/50 blur-3xl" />
+      <div data-orb className="absolute bottom-8 right-1/4 h-44 w-44 rounded-full bg-moss/10 blur-3xl" />
+    </div>
+  )
+}
+
+// EntryForm — 玻璃拟态登录卡，挂载时用 timeline 编排「模糊聚焦 + 子元素错峰」入场，图标光环呼吸。
+function EntryForm({
+  username,
+  password,
+  onUsernameChange,
+  onPasswordChange,
+  onSubmit,
+  loading,
+  message,
+  messageType,
+}: {
+  username: string
+  password: string
+  onUsernameChange: (value: string) => void
+  onPasswordChange: (value: string) => void
+  onSubmit: () => void
+  loading: boolean
+  message: string
+  messageType: 'info' | 'error' | 'ok'
+}) {
+  const ref = useRef<HTMLElement>(null)
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const ctx = gsap.context(() => {
+      const tl = gsap.timeline({ defaults: { ease: 'power3.out' } })
+      tl.fromTo(
+        el,
+        { autoAlpha: 0, y: 30, scale: 0.94, filter: 'blur(12px)' },
+        { autoAlpha: 1, y: 0, scale: 1, filter: 'blur(0px)', duration: 0.85 },
+      ).fromTo(
+        '[data-entry-item]',
+        { autoAlpha: 0, y: 16 },
+        { autoAlpha: 1, y: 0, duration: 0.5, stagger: 0.08 },
+        '-=0.45',
+      )
+      gsap.to('[data-mark-ring]', {
+        scale: 1.18,
+        autoAlpha: 0.35,
+        duration: 1.6,
+        ease: 'sine.inOut',
+        repeat: -1,
+        yoyo: true,
+      })
+    }, el)
+    return () => ctx.revert()
+  }, [])
+  return (
+    <section
+      ref={ref}
+      className="relative z-10 w-full max-w-[440px] overflow-hidden rounded-[26px] border border-white/60 bg-canvas/85 p-8 shadow-[0_24px_70px_-28px_rgba(31,30,28,0.35)] backdrop-blur-xl"
+    >
+      <div
+        aria-hidden
+        className="pointer-events-none absolute -top-24 left-1/2 h-48 w-56 -translate-x-1/2 rounded-full bg-coral-200/40 blur-3xl"
+      />
+      <div data-entry-item className="relative mb-7 flex items-center gap-3">
+        <div className="relative grid h-12 w-12 place-items-center">
+          <span data-mark-ring className="absolute inset-0 rounded-2xl bg-coral-300/40 blur-[2px]" />
+          <span className="relative grid h-12 w-12 place-items-center rounded-2xl bg-gradient-to-br from-coral-400 to-coral-600 text-white shadow-lg shadow-coral-500/30">
+            <PhoneMark className="h-5 w-5" />
+          </span>
+        </div>
+        <div>
+          <h2 className="text-[19px] font-semibold tracking-tightish text-warmgray-900">
+            手机号注册控制台
+          </h2>
+          <p className="mt-0.5 text-[12px] text-warmgray-500">输入 username 进入专属看板</p>
+        </div>
+      </div>
+      <label data-entry-item className="grid gap-1.5 text-[12px] font-medium text-warmgray-600">
+        Username
+        <input
+          className={`${inputClass} h-11 px-3.5 text-[14px]`}
+          value={username}
+          onChange={(event) => onUsernameChange(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') onSubmit()
+          }}
+          autoComplete="off"
+          placeholder="输入 username"
+          autoFocus
+        />
+      </label>
+      <label data-entry-item className="mt-3 grid gap-1.5 text-[12px] font-medium text-warmgray-600">
+        Password
+        <input
+          className={`${inputClass} h-11 px-3.5 text-[14px]`}
+          type="password"
+          value={password}
+          onChange={(event) => onPasswordChange(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') onSubmit()
+          }}
+          autoComplete="current-password"
+          placeholder="输入密码"
+        />
+      </label>
+      <button
+        data-entry-item
+        className="group mt-4 flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-coral-500 px-4 text-[13px] font-semibold text-white shadow-lg shadow-coral-500/25 transition-all hover:bg-coral-600 hover:shadow-coral-500/35 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-60"
+        type="button"
+        onClick={onSubmit}
+        disabled={loading}
+      >
+        {loading ? (
+          <>
+            <Spinner /> 进入中…
+          </>
+        ) : (
+          <>
+            进入
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth={2}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className="h-4 w-4 transition-transform group-hover:translate-x-0.5"
+            >
+              <path d="M5 12h14M13 6l6 6-6 6" />
+            </svg>
+          </>
+        )}
+      </button>
+      <div data-entry-item>
+        <MessageLine message={message} type={messageType} className="mt-3" />
+      </div>
+      <p
+        data-entry-item
+        className="mt-5 border-t border-warmgray-100 pt-3 text-[11px] leading-4 text-warmgray-400"
+      >
+        会话信息缓存在本浏览器，下次进入将自动恢复。
+      </p>
+    </section>
+  )
+}
+
+// EntryLoading — 自动恢复会话时的加载视图：旋转光环 + 呼吸光晕 + 渐变图标，避免切回本页时闪现登录表单。
+function EntryLoading({ username }: { username: string }) {
+  const ref = useRef<HTMLDivElement>(null)
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const ctx = gsap.context(() => {
+      gsap.from(el, { autoAlpha: 0, scale: 0.9, duration: 0.55, ease: 'power3.out' })
+      gsap.to('[data-load-ring]', { rotation: 360, duration: 1.1, ease: 'none', repeat: -1 })
+      gsap.to('[data-load-pulse]', {
+        scale: 1.25,
+        autoAlpha: 0.25,
+        duration: 1,
+        ease: 'sine.inOut',
+        repeat: -1,
+        yoyo: true,
+      })
+    }, el)
+    return () => ctx.revert()
+  }, [])
+  return (
+    <div ref={ref} className="relative z-10 flex flex-col items-center gap-5">
+      <div className="relative grid h-16 w-16 place-items-center">
+        <span data-load-pulse className="absolute inset-0 rounded-full bg-coral-200/55 blur-md" />
+        <span data-load-ring className="absolute inset-0 rounded-full border-[2.5px] border-coral-200 border-t-coral-500" />
+        <span className="relative grid h-11 w-11 place-items-center rounded-xl bg-gradient-to-br from-coral-400 to-coral-600 text-white shadow-lg shadow-coral-500/30">
+          <PhoneMark className="h-5 w-5" />
+        </span>
+      </div>
+      <div className="text-center">
+        <div className="text-[14px] font-semibold text-warmgray-900">正在进入控制台</div>
+        <div className="mt-1 text-[12px] text-warmgray-500">
+          {username ? `恢复 ${username} 的会话…` : '加载中…'}
+        </div>
+      </div>
     </div>
   )
 }

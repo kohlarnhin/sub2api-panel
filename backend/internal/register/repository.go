@@ -22,6 +22,7 @@ func (r *Repository) EnsureSchema(ctx context.Context) error {
 		CREATE TABLE IF NOT EXISTS register_users (
 			id BIGSERIAL PRIMARY KEY,
 			username TEXT NOT NULL UNIQUE,
+			password TEXT NOT NULL DEFAULT '5nuEGNrh7h4km5aTAy81',
 			group_id BIGINT NOT NULL,
 			is_duck BOOLEAN NOT NULL DEFAULT FALSE,
 			otp_email TEXT NOT NULL DEFAULT '',
@@ -29,6 +30,10 @@ func (r *Repository) EnsureSchema(ctx context.Context) error {
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)
 		`,
+		`ALTER TABLE register_users ADD COLUMN IF NOT EXISTS password TEXT NOT NULL DEFAULT '5nuEGNrh7h4km5aTAy81'`,
+		`ALTER TABLE register_users ALTER COLUMN password SET DEFAULT '5nuEGNrh7h4km5aTAy81'`,
+		`UPDATE register_users SET password = '5nuEGNrh7h4km5aTAy81' WHERE COALESCE(password, '') = ''`,
+		`ALTER TABLE register_users ALTER COLUMN password SET NOT NULL`,
 		`ALTER TABLE register_users ADD COLUMN IF NOT EXISTS otp_email TEXT NOT NULL DEFAULT ''`,
 		`
 		CREATE TABLE IF NOT EXISTS user_email (
@@ -82,13 +87,13 @@ func (r *Repository) GetRegisterUserByUsername(ctx context.Context, username str
 		return nil, fmt.Errorf("username 不能为空")
 	}
 	const q = `
-		SELECT id, username, group_id, is_duck, COALESCE(otp_email, ''), created_at, updated_at
+		SELECT id, username, group_id, is_duck, COALESCE(otp_email, ''), password, created_at, updated_at
 		FROM register_users
 		WHERE LOWER(username) = LOWER($1)
 		LIMIT 1
 	`
 	var user RegisterUser
-	if err := r.db.QueryRowContext(ctx, q, username).Scan(&user.ID, &user.Username, &user.GroupID, &user.IsDuck, &user.OTPEmail, &user.CreatedAt, &user.UpdatedAt); err != nil {
+	if err := r.db.QueryRowContext(ctx, q, username).Scan(&user.ID, &user.Username, &user.GroupID, &user.IsDuck, &user.OTPEmail, &user.Password, &user.CreatedAt, &user.UpdatedAt); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("用户不存在: %s", username)
 		}
@@ -102,13 +107,13 @@ func (r *Repository) GetRegisterUserByID(ctx context.Context, userID int64) (*Re
 		return nil, fmt.Errorf("user_id 无效")
 	}
 	const q = `
-		SELECT id, username, group_id, is_duck, COALESCE(otp_email, ''), created_at, updated_at
+		SELECT id, username, group_id, is_duck, COALESCE(otp_email, ''), password, created_at, updated_at
 		FROM register_users
 		WHERE id = $1
 		LIMIT 1
 	`
 	var user RegisterUser
-	if err := r.db.QueryRowContext(ctx, q, userID).Scan(&user.ID, &user.Username, &user.GroupID, &user.IsDuck, &user.OTPEmail, &user.CreatedAt, &user.UpdatedAt); err != nil {
+	if err := r.db.QueryRowContext(ctx, q, userID).Scan(&user.ID, &user.Username, &user.GroupID, &user.IsDuck, &user.OTPEmail, &user.Password, &user.CreatedAt, &user.UpdatedAt); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("用户不存在: %d", userID)
 		}
@@ -117,20 +122,22 @@ func (r *Repository) GetRegisterUserByID(ctx context.Context, userID int64) (*Re
 	return &user, nil
 }
 
-func (r *Repository) UpdateRegisterUser(ctx context.Context, userID int64, otpEmail string) (*RegisterUser, error) {
+func (r *Repository) UpdateRegisterUser(ctx context.Context, userID int64, otpEmail, password string) (*RegisterUser, error) {
 	if userID <= 0 {
 		return nil, fmt.Errorf("user_id 无效")
 	}
 	otpEmail = strings.TrimSpace(otpEmail)
+	password = strings.TrimSpace(password)
 	const q = `
 		UPDATE register_users
 		SET otp_email = $2,
+		    password = COALESCE(NULLIF($3, ''), password),
 		    updated_at = NOW()
 		WHERE id = $1
-		RETURNING id, username, group_id, is_duck, COALESCE(otp_email, ''), created_at, updated_at
+		RETURNING id, username, group_id, is_duck, COALESCE(otp_email, ''), password, created_at, updated_at
 	`
 	var user RegisterUser
-	if err := r.db.QueryRowContext(ctx, q, userID, otpEmail).Scan(&user.ID, &user.Username, &user.GroupID, &user.IsDuck, &user.OTPEmail, &user.CreatedAt, &user.UpdatedAt); err != nil {
+	if err := r.db.QueryRowContext(ctx, q, userID, otpEmail, password).Scan(&user.ID, &user.Username, &user.GroupID, &user.IsDuck, &user.OTPEmail, &user.Password, &user.CreatedAt, &user.UpdatedAt); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("用户不存在: %d", userID)
 		}
