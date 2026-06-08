@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -129,7 +130,9 @@ func BuildSub2APIPayload(email string, tokenData map[string]any, groupIDs []int6
 		"priority":    1,
 	}
 	if proxyID = strings.TrimSpace(proxyID); proxyID != "" {
-		payload["proxy_id"] = proxyID
+		if id, err := strconv.ParseInt(proxyID, 10, 64); err == nil && id > 0 {
+			payload["proxy_id"] = id
+		}
 	}
 	return payload
 }

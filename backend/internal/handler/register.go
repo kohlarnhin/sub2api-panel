@@ -92,6 +92,20 @@ func (h *RegisterHandler) GenerateUserEmails(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 
+func (h *RegisterHandler) UploadUserAccountSub2API(c *gin.Context) {
+	var payload register.UserSub2APIUploadRequest
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	result, err := h.svc.UploadUserAccountSub2API(c.Request.Context(), payload)
+	if err != nil {
+		c.JSON(statusForRegisterError(err), gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
 func (h *RegisterHandler) StartUserRegister(c *gin.Context) {
 	var payload register.UserRegisterStartRequest
 	if err := c.ShouldBindJSON(&payload); err != nil {

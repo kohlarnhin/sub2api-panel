@@ -117,6 +117,7 @@ type UserEmailListItem = {
   phone: string
   account_status: string
   account_error?: string
+  sub2api_ready: boolean
   sub2api_uploaded: boolean
   created_at: string
   updated_at: string
@@ -451,6 +452,7 @@ export function PhoneRegisterPanel() {
   const [otpEmail, setOtpEmail] = useState('')
   const [newPassword, setNewPassword] = useState('')
   const [emailLoading, setEmailLoading] = useState(false)
+  const [sub2APIUploadingAccountID, setSub2APIUploadingAccountID] = useState<number | null>(null)
   const [message, setMessage] = useState('请输入 username 进入注册控制台')
   const [messageType, setMessageType] = useState<'info' | 'error' | 'ok'>('info')
   const [loading, setLoading] = useState(false)
@@ -805,6 +807,12 @@ export function PhoneRegisterPanel() {
         setMessageType('error')
         return
       }
+      const proxyID = customSub2APIProxyID.trim()
+      if (proxyID && !/^[1-9]\d*$/.test(proxyID)) {
+        setMessage('自定义 Sub2API 代理 ID 必须是正整数')
+        setMessageType('error')
+        return
+      }
     }
     setLoading(true)
     setMessage(`正在启动 ${count} 个账号的注册任务...`)
@@ -849,6 +857,80 @@ export function PhoneRegisterPanel() {
       renderError(err)
     } finally {
       setLoading(false)
+    }
+  }
+
+  const uploadEmailAccountSub2API = async (item: UserEmailListItem) => {
+    if (!user || !item.account_id) return
+    if (!item.sub2api_ready) {
+      setMessage('当前邮箱还没有可上传的 Sub2API JSON')
+      setMessageType('error')
+      return
+    }
+    if (customSub2APIEnabled) {
+      if (!customSub2APIBaseURL.trim()) {
+        setMessage('请输入自定义 Sub2API 地址')
+        setMessageType('error')
+        return
+      }
+      if (!customSub2APIKey.trim()) {
+        setMessage('请输入自定义 Sub2API 密钥')
+        setMessageType('error')
+        return
+      }
+      if (customGroupIDs.length === 0) {
+        setMessage('请输入自定义上传分组')
+        setMessageType('error')
+        return
+      }
+      const proxyID = customSub2APIProxyID.trim()
+      if (proxyID && !/^[1-9]\d*$/.test(proxyID)) {
+        setMessage('自定义 Sub2API 代理 ID 必须是正整数')
+        setMessageType('error')
+        return
+      }
+    }
+    setSub2APIUploadingAccountID(item.account_id)
+    setMessage(`正在上传 ${item.email} 到 Sub2API...`)
+    setMessageType('info')
+    try {
+      const customSettings = {
+        enabled: customSub2APIEnabled,
+        baseURL: customSub2APIBaseURL,
+        apiKey: customSub2APIKey,
+        groupIDs: customSub2APIGroups,
+        proxyID: customSub2APIProxyID,
+      }
+      saveCustomSub2APISettings(customSettings, user)
+      const result = await requestJSON<{ upload_target?: string }>(
+        '/api/phone-register/user/accounts/sub2api/upload',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            user_id: user.id,
+            account_id: item.account_id,
+            custom_sub2api: customSub2APIEnabled
+              ? {
+                  enabled: true,
+                  base_url: customSub2APIBaseURL.trim(),
+                  api_key: customSub2APIKey.trim(),
+                  group_ids: customGroupIDs,
+                  proxy_id: customSub2APIProxyID.trim(),
+                }
+              : { enabled: false },
+          }),
+        },
+      )
+      setCustomSub2APIGroups(customGroupIDs.join(','))
+      setMessage(`已上传到${result.upload_target || 'Sub2API'}`)
+      setMessageType('ok')
+      await refreshDashboard(user.id, true)
+      await refreshEmails(user.id, emailPageRef.current)
+    } catch (err) {
+      renderError(err)
+      await refreshEmails(user.id, emailPageRef.current).catch(() => undefined)
+    } finally {
+      setSub2APIUploadingAccountID(null)
     }
   }
 
@@ -1245,11 +1327,13 @@ export function PhoneRegisterPanel() {
                       代理 ID
                       <input
                         className={`${inputClass} h-10 px-3 text-[13px]`}
+                        inputMode="numeric"
+                        pattern="[0-9]*"
                         value={customSub2APIProxyID}
                         onChange={(event) => setCustomSub2APIProxyID(event.target.value)}
                         disabled={loading || isRunning}
                         autoComplete="off"
-                        placeholder="可选，留空则不上传 proxy_id"
+                        placeholder="可选，例如 1"
                       />
                     </label>
                   </div>
@@ -1321,6 +1405,8 @@ export function PhoneRegisterPanel() {
           onClear={() => void clearEmailSearch()}
           onRefresh={() => user && void refreshEmails(user.id, emailPage)}
           onPageChange={(page) => void changeEmailPage(page)}
+          uploadingAccountID={sub2APIUploadingAccountID}
+          onUploadSub2API={(item) => void uploadEmailAccountSub2API(item)}
         />
       </section>
     </main>
@@ -1540,6 +1626,8 @@ function EmailTable({
   onClear,
   onRefresh,
   onPageChange,
+  uploadingAccountID,
+  onUploadSub2API,
 }: {
   emailList: UserEmailListResponse
   emailPage: number
@@ -1551,6 +1639,8 @@ function EmailTable({
   onClear: () => void
   onRefresh: () => void
   onPageChange: (page: number) => void
+  uploadingAccountID: number | null
+  onUploadSub2API: (item: UserEmailListItem) => void
 }) {
   const maxPage = Math.max(1, emailList.total_pages || 1)
   const start = emailList.total ? (emailList.page - 1) * emailList.page_size + 1 : 0
@@ -1620,11 +1710,12 @@ function EmailTable({
       <div className="min-h-0 flex-1 overflow-auto">
         <table className="min-w-full table-fixed border-separate border-spacing-0 text-left">
           <colgroup>
-            <col className="w-[34%]" />
-            <col className="w-[18%]" />
-            <col className="w-[18%]" />
-            <col className="w-[14%]" />
+            <col className="w-[30%]" />
             <col className="w-[16%]" />
+            <col className="w-[17%]" />
+            <col className="w-[14%]" />
+            <col className="w-[14%]" />
+            <col className="w-[9%]" />
           </colgroup>
           <thead className="sticky top-0 z-10 bg-canvas">
             <tr className="text-[11px] uppercase text-warmgray-400">
@@ -1632,7 +1723,8 @@ function EmailTable({
               <th className="border-b border-warmgray-100 px-4 py-2 font-semibold">手机号</th>
               <th className="border-b border-warmgray-100 px-4 py-2 font-semibold">状态</th>
               <th className="border-b border-warmgray-100 px-4 py-2 font-semibold">Sub2API</th>
-              <th className="border-b border-warmgray-100 px-5 py-2 font-semibold">使用时间</th>
+              <th className="border-b border-warmgray-100 px-4 py-2 font-semibold">使用时间</th>
+              <th className="border-b border-warmgray-100 px-5 py-2 font-semibold">操作</th>
             </tr>
           </thead>
           <tbody ref={rowsRef} className="divide-y divide-warmgray-100">
@@ -1681,17 +1773,35 @@ function EmailTable({
                         {item.sub2api_uploaded ? '已上传' : item.account_status ? '未上传' : '-'}
                       </span>
                     </td>
-                    <td className="px-5 py-3">
+                    <td className="px-4 py-3">
                       <span className="num whitespace-nowrap text-warmgray-500">
                         {formatDateTime(item.used_at)}
                       </span>
+                    </td>
+                    <td className="px-5 py-3">
+                      {item.account_id && item.sub2api_ready ? (
+                        <button
+                          className="h-8 whitespace-nowrap rounded-md border border-coral-200 bg-white px-2.5 text-[11px] font-semibold text-coral-700 transition-colors hover:bg-coral-50 disabled:cursor-not-allowed disabled:opacity-50"
+                          type="button"
+                          onClick={() => onUploadSub2API(item)}
+                          disabled={emailLoading || uploadingAccountID === item.account_id}
+                        >
+                          {uploadingAccountID === item.account_id
+                            ? '上传中'
+                            : item.sub2api_uploaded
+                              ? '重传'
+                              : '上传'}
+                        </button>
+                      ) : (
+                        <span className="text-[11px] text-warmgray-400">-</span>
+                      )}
                     </td>
                   </tr>
                 )
               })
             ) : (
               <tr>
-                <td colSpan={5} className="px-5 py-16 text-center text-[13px] text-warmgray-400">
+                <td colSpan={6} className="px-5 py-16 text-center text-[13px] text-warmgray-400">
                   {emailLoading ? '正在加载邮箱列表...' : emailQuery ? '没有匹配的邮箱或手机号。' : '暂无邮箱记录。'}
                 </td>
               </tr>

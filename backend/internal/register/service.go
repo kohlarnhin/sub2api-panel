@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -310,6 +311,60 @@ func (s *Service) GenerateUserEmails(ctx context.Context, req UserEmailGenerateR
 		return result, fmt.Errorf("Duck 邮箱创建失败: %s", result.Errors[0])
 	}
 	return result, nil
+}
+
+func (s *Service) UploadUserAccountSub2API(ctx context.Context, req UserSub2APIUploadRequest) (map[string]any, error) {
+	user, err := s.repo.GetRegisterUserByID(ctx, req.UserID)
+	if err != nil {
+		return nil, err
+	}
+	target, err := s.repo.GetUserAccountSub2APIUploadTarget(ctx, user.ID, req.AccountID)
+	if err != nil {
+		return nil, err
+	}
+	payload := cloneMap(target.Sub2APIJSON)
+	if len(payload) == 0 {
+		return nil, fmt.Errorf("当前账号还没有可上传的 Sub2API JSON")
+	}
+	options, err := validateUserRegisterRunOptions(req.CustomSub2API)
+	if err != nil {
+		return nil, err
+	}
+	client := s.sub2api
+	groupIDs := normalizeGroupIDs([]int64{user.GroupID})
+	proxyID := ""
+	uploadTarget := "用户 Sub2API 分组"
+	if options.Sub2API != nil && options.Sub2API.Enabled {
+		client = NewSub2APIClient(options.Sub2API.BaseURL, options.Sub2API.APIKey)
+		groupIDs = normalizeGroupIDs(options.Sub2API.GroupIDs)
+		proxyID = options.Sub2API.ProxyID
+		uploadTarget = "自定义 Sub2API 分组"
+	}
+	payload["group_ids"] = groupIDs
+	if proxyID != "" {
+		id, err := strconv.ParseInt(proxyID, 10, 64)
+		if err != nil || id <= 0 {
+			return nil, fmt.Errorf("自定义 Sub2API 代理 ID 必须是正整数")
+		}
+		payload["proxy_id"] = id
+	} else {
+		delete(payload, "proxy_id")
+	}
+	uploadResult, err := client.Upload(ctx, payload)
+	if err != nil {
+		_ = s.repo.UpdateUserAccountStatus(ctx, req.AccountID, statusFailed, err.Error())
+		return nil, err
+	}
+	if err := s.repo.SaveUserAccountSub2APIUploadResult(ctx, user.ID, req.AccountID, payload, uploadResult); err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"ok":            true,
+		"account_id":    req.AccountID,
+		"upload_target": uploadTarget,
+		"sub2api_json":  payload,
+		"upload_result": uploadResult,
+	}, nil
 }
 
 func (s *Service) StartUserRegister(ctx context.Context, req UserRegisterStartRequest) (*UserDashboard, error) {
@@ -1718,12 +1773,19 @@ func validateUserRegisterRunOptions(custom *CustomSub2APIConfig) (userRegisterRu
 	if len(groupIDs) == 0 {
 		return options, fmt.Errorf("自定义 Sub2API 分组不能为空")
 	}
+	proxyID := strings.TrimSpace(custom.ProxyID)
+	if proxyID != "" {
+		id, err := strconv.ParseInt(proxyID, 10, 64)
+		if err != nil || id <= 0 {
+			return options, fmt.Errorf("自定义 Sub2API 代理 ID 必须是正整数")
+		}
+	}
 	options.Sub2API = &CustomSub2APIConfig{
 		Enabled:  true,
 		BaseURL:  baseURL,
 		APIKey:   apiKey,
 		GroupIDs: groupIDs,
-		ProxyID:  strings.TrimSpace(custom.ProxyID),
+		ProxyID:  proxyID,
 	}
 	return options, nil
 }

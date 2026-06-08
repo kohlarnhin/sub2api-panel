@@ -52,6 +52,12 @@ type UserEmailGenerateRequest struct {
 	DuckAuthorization string `json:"duck_authorization"`
 }
 
+type UserSub2APIUploadRequest struct {
+	UserID        int64                `json:"user_id" binding:"required"`
+	AccountID     int64                `json:"account_id" binding:"required"`
+	CustomSub2API *CustomSub2APIConfig `json:"custom_sub2api,omitempty"`
+}
+
 type UserRegisterStartRequest struct {
 	UserID        int64                `json:"user_id" binding:"required"`
 	APIKey        string               `json:"api_key" binding:"required"`
@@ -180,6 +186,7 @@ type UserEmailListItem struct {
 	Phone           string     `json:"phone"`
 	AccountStatus   string     `json:"account_status"`
 	AccountError    string     `json:"account_error,omitempty"`
+	Sub2APIReady    bool       `json:"sub2api_ready"`
 	Sub2APIUploaded bool       `json:"sub2api_uploaded"`
 	CreatedAt       time.Time  `json:"created_at"`
 	UpdatedAt       time.Time  `json:"updated_at"`
@@ -203,6 +210,15 @@ type UserAccount struct {
 	Error     string    `json:"error"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type UserAccountSub2APIUploadTarget struct {
+	ID           int64          `json:"id"`
+	UserID       int64          `json:"user_id"`
+	UserGroupID  int64          `json:"user_group_id"`
+	Email        string         `json:"email"`
+	Sub2APIJSON  map[string]any `json:"sub2api_json"`
+	UploadResult map[string]any `json:"sub2api_upload_result,omitempty"`
 }
 
 type UserSummary struct {

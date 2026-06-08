@@ -390,6 +390,81 @@ func (r *Repository) FinalizeUserPhoneAccount(
 	return map[string]any{"ok": true, "stage": "user_account_finalized", "account_id": accountID, "user_email_id": email.ID}
 }
 
+func (r *Repository) GetUserAccountSub2APIUploadTarget(ctx context.Context, userID, accountID int64) (*UserAccountSub2APIUploadTarget, error) {
+	if userID <= 0 || accountID <= 0 {
+		return nil, fmt.Errorf("user_id 或 account_id 无效")
+	}
+	const q = `
+		SELECT
+			a.id,
+			a.user_id,
+			u.group_id,
+			COALESCE(a.email, ''),
+			COALESCE(a.sub2api_json, '{}'),
+			COALESCE(a.sub2api_upload_result, '{}')
+		FROM user_phone_accounts a
+		JOIN register_users u ON u.id = a.user_id
+		WHERE a.user_id = $1
+		  AND a.id = $2
+		LIMIT 1
+	`
+	var target UserAccountSub2APIUploadTarget
+	var sub2apiRaw, uploadRaw string
+	if err := r.db.QueryRowContext(ctx, q, userID, accountID).Scan(
+		&target.ID,
+		&target.UserID,
+		&target.UserGroupID,
+		&target.Email,
+		&sub2apiRaw,
+		&uploadRaw,
+	); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("账号不存在或不属于当前用户")
+		}
+		return nil, fmt.Errorf("query user account sub2api: %w", err)
+	}
+	if err := json.Unmarshal([]byte(firstString(sub2apiRaw, "{}")), &target.Sub2APIJSON); err != nil {
+		return nil, fmt.Errorf("解析账号 Sub2API JSON 失败: %w", err)
+	}
+	if err := json.Unmarshal([]byte(firstString(uploadRaw, "{}")), &target.UploadResult); err != nil {
+		target.UploadResult = map[string]any{}
+	}
+	return &target, nil
+}
+
+func (r *Repository) SaveUserAccountSub2APIUploadResult(ctx context.Context, userID, accountID int64, sub2apiJSON, uploadResult map[string]any) error {
+	if userID <= 0 || accountID <= 0 {
+		return fmt.Errorf("user_id 或 account_id 无效")
+	}
+	sub2apiRaw, err := json.Marshal(sub2apiJSON)
+	if err != nil {
+		return fmt.Errorf("marshal sub2api json: %w", err)
+	}
+	uploadRaw, err := json.Marshal(uploadResult)
+	if err != nil {
+		return fmt.Errorf("marshal upload result: %w", err)
+	}
+	const q = `
+		UPDATE user_phone_accounts
+		SET sub2api_json = $3,
+		    sub2api_upload_result = $4,
+		    status = 'success',
+		    error = '',
+		    updated_at = NOW()
+		WHERE user_id = $1
+		  AND id = $2
+	`
+	result, err := r.db.ExecContext(ctx, q, userID, accountID, string(sub2apiRaw), string(uploadRaw))
+	if err != nil {
+		return fmt.Errorf("save user account sub2api upload result: %w", err)
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return fmt.Errorf("账号不存在或不属于当前用户")
+	}
+	return nil
+}
+
 // MarkUserEmailUsed 把 user_email 标记为已使用（used_at），并在尚未关联账号时补上
 // account_id。用于「邮箱已绑定账号、但后续 token 步骤失败」的场景：即便整体失败，也要
 // 占用该邮箱，避免下次注册重复选到这个已绑定到失败账号的邮箱。used_at 用 COALESCE 保留
@@ -564,20 +639,25 @@ func (r *Repository) ListUserEmails(ctx context.Context, userID int64, page, pag
 			e.email,
 			e.provider,
 			e.used_at,
-			COALESCE(e.account_id, 0),
+			COALESCE(NULLIF(e.account_id, 0), a.id, 0),
 			COALESCE(a.phone, ''),
 			COALESCE(a.status, ''),
 			COALESCE(a.error, ''),
 			CASE
 				WHEN a.id IS NULL THEN FALSE
-				WHEN a.status = 'success' AND COALESCE(a.sub2api_upload_result, '{}') <> '{}' THEN TRUE
+				WHEN COALESCE(a.sub2api_json, '{}') <> '{}' THEN TRUE
+				ELSE FALSE
+			END,
+			CASE
+				WHEN a.id IS NULL THEN FALSE
+				WHEN COALESCE(a.sub2api_upload_result, '{}') <> '{}' THEN TRUE
 				ELSE FALSE
 			END,
 			e.created_at,
 			e.updated_at
 		FROM user_email e
 		LEFT JOIN LATERAL (
-			SELECT id, phone, status, error, sub2api_upload_result
+			SELECT id, phone, status, error, sub2api_json, sub2api_upload_result
 			FROM user_phone_accounts a
 			WHERE a.user_id = e.user_id
 			  AND (a.id = e.account_id OR a.user_email_id = e.id)
@@ -609,6 +689,7 @@ func (r *Repository) ListUserEmails(ctx context.Context, userID int64, page, pag
 			&item.Phone,
 			&item.AccountStatus,
 			&item.AccountError,
+			&item.Sub2APIReady,
 			&item.Sub2APIUploaded,
 			&item.CreatedAt,
 			&item.UpdatedAt,
