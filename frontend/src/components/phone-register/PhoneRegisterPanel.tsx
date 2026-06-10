@@ -162,6 +162,7 @@ const USERNAME_STORAGE = 'sub2api-panel:phone-register-username'
 const PASSWORD_STORAGE = 'sub2api-panel:phone-register-password'
 const HERO_KEY_STORAGE = 'sub2api-panel:herosms-api-key'
 const DUCK_AUTH_STORAGE = 'sub2api-panel:duck-authorization'
+const DUCK_PROXY_STORAGE = 'sub2api-panel:duck-proxy'
 const REGISTER_COUNT_STORAGE = 'sub2api-panel:user-register-count'
 const EMAIL_COUNT_STORAGE = 'sub2api-panel:user-email-count'
 const CUSTOM_SUB2API_ENABLED_STORAGE = 'sub2api-panel:custom-sub2api-enabled'
@@ -418,6 +419,7 @@ export function PhoneRegisterPanel() {
   )
   const [apiKey, setApiKey] = useState(() => localStorage.getItem(HERO_KEY_STORAGE) || '')
   const [duckAuth, setDuckAuth] = useState(() => localStorage.getItem(DUCK_AUTH_STORAGE) || '')
+    const [duckProxy, setDuckProxy] = useState(() => localStorage.getItem(DUCK_PROXY_STORAGE) || '')
   const [registerCount, setRegisterCount] = useState(
     () => localStorage.getItem(REGISTER_COUNT_STORAGE) || '1',
   )
@@ -738,6 +740,8 @@ export function PhoneRegisterPanel() {
       if (user.is_duck) {
         localStorage.setItem(DUCK_AUTH_STORAGE, duckAuth.trim())
         localStorage.setItem(userStorageKey(DUCK_AUTH_STORAGE, user), duckAuth.trim())
+        localStorage.setItem(DUCK_PROXY_STORAGE, duckProxy.trim())
+        localStorage.setItem(userStorageKey(DUCK_PROXY_STORAGE, user), duckProxy.trim())
       }
       const result = await requestJSON<EmailGenerateResult>(
         '/api/phone-register/user/emails/generate',
@@ -747,6 +751,7 @@ export function PhoneRegisterPanel() {
             user_id: user.id,
             count,
             duck_authorization: duckAuth.trim(),
+            proxy: duckProxy.trim(),
           }),
         },
       )
@@ -1208,6 +1213,18 @@ export function PhoneRegisterPanel() {
                     disabled={loading || isEmailGenerating}
                     autoComplete="off"
                     placeholder="不需要输入 Bearer"
+                  />
+                </label>
+                <label className="grid gap-1.5 text-[12px] font-medium text-warmgray-600">
+                  代理地址（可选）
+                  <input
+                    className={`${inputClass} h-10 px-3 text-[13px]`}
+                    type="text"
+                    value={duckProxy}
+                    onChange={(event) => setDuckProxy(event.target.value)}
+                    disabled={loading || isEmailGenerating}
+                    autoComplete="off"
+                    placeholder="http://127.0.0.1:7890"
                   />
                 </label>
                 <button

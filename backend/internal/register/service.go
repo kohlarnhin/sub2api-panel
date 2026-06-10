@@ -273,7 +273,7 @@ func (s *Service) GenerateUserEmails(ctx context.Context, req UserEmailGenerateR
 		result.Attempts++
 		s.updateUserEmailRunProgress(user.ID, result)
 		s.touchUserEmailRun(user.ID, statusRunning, fmt.Sprintf("正在创建 Duck 邮箱 %d/%d（第 %d 次请求）", result.Created+1, count, result.Attempts), "", "", "")
-		email, raw, err := s.duck.CreateEmail(ctx, auth)
+		email, raw, err := s.duck.CreateEmail(ctx, auth, req.Proxy)
 		if err != nil {
 			result.Errors = append(result.Errors, err.Error())
 			result.Failed++

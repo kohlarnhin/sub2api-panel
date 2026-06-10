@@ -50,6 +50,10 @@ type UserEmailGenerateRequest struct {
 	UserID            int64  `json:"user_id" binding:"required"`
 	Count             int    `json:"count"`
 	DuckAuthorization string `json:"duck_authorization"`
+	// Proxy 为 Duck 邮箱创建请求使用的代理地址，支持 http/https/socks5 协议。
+	// 例如: http://127.0.0.1:7890 , socks5://user:pass@host:port
+	// 留空则不使用代理。
+	Proxy string `json:"proxy"`
 }
 
 type UserSub2APIUploadRequest struct {
