@@ -58,12 +58,14 @@ type sentinelInput struct {
 	PageURL      string `json:"page_url"`
 	UserAgent    string `json:"user_agent"`
 	CookieHeader string `json:"cookie_header"`
+	Proxy        string `json:"proxy"`
+	FetchHelper  string `json:"fetch_helper,omitempty"`
 }
 
 // newImpersonatedClient 创建一个伪装成 Chrome TLS 指纹的 HTTP 客户端，
 // 用于通过 auth.openai.com 前置的 Cloudflare Bot 检测（等价于参考项目里
 // curl_cffi 的 impersonate="chrome"）。传入 jar 时共享同一 cookie 容器。
-func newImpersonatedClient(jar http.CookieJar) (tls_client.HttpClient, error) {
+func newImpersonatedClient(jar http.CookieJar, proxyURL string) (tls_client.HttpClient, error) {
 	opts := []tls_client.HttpClientOption{
 		tls_client.WithClientProfile(profiles.Chrome_146_PSK),
 		tls_client.WithTimeoutSeconds(int(defaultHTTPTimeout / time.Second)),
@@ -72,15 +74,22 @@ func newImpersonatedClient(jar http.CookieJar) (tls_client.HttpClient, error) {
 	if jar != nil {
 		opts = append(opts, tls_client.WithCookieJar(jar))
 	}
+	if proxyURL = strings.TrimSpace(proxyURL); proxyURL != "" {
+		opts = append(opts, tls_client.WithProxyUrl(proxyURL))
+	}
 	return tls_client.NewHttpClient(tls_client.NewNoopLogger(), opts...)
 }
 
 func newAuthSession() (*AuthSession, error) {
+	return newAuthSessionWithProxy("")
+}
+
+func newAuthSessionWithProxy(proxyURL string) (*AuthSession, error) {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		return nil, err
 	}
-	client, err := newImpersonatedClient(jar)
+	client, err := newImpersonatedClient(jar, proxyURL)
 	if err != nil {
 		return nil, err
 	}
@@ -233,7 +242,7 @@ func authSessionCookieValue(jar http.CookieJar) string {
 	return ""
 }
 
-func mintSentinelHeaders(ctx context.Context, scriptPath, did, flow, cookieHeader, pageURL string) (http.Header, error) {
+func mintSentinelHeaders(ctx context.Context, scriptPath, did, flow, cookieHeader, pageURL, proxyURL string) (http.Header, error) {
 	if strings.TrimSpace(did) == "" {
 		return nil, fmt.Errorf("生成 Sentinel 头时缺少 oai-did")
 	}
@@ -250,6 +259,8 @@ func mintSentinelHeaders(ctx context.Context, scriptPath, did, flow, cookieHeade
 		PageURL:      pageURL,
 		UserAgent:    browserUserAgent,
 		CookieHeader: cookieHeader,
+		Proxy:        strings.TrimSpace(proxyURL),
+		FetchHelper:  sentinelFetchHelperPath(),
 	}
 	payload, err := json.Marshal(input)
 	if err != nil {
@@ -260,6 +271,9 @@ func mintSentinelHeaders(ctx context.Context, scriptPath, did, flow, cookieHeade
 		cmdCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 		cmd := exec.CommandContext(cmdCtx, "node", scriptPath)
 		cmd.Stdin = bytes.NewReader(payload)
+		if input.FetchHelper != "" {
+			cmd.Env = append(os.Environ(), "SUB2API_SENTINEL_FETCH_HELPER="+input.FetchHelper)
+		}
 		out, err := cmd.CombinedOutput()
 		cancel()
 		if err != nil {
@@ -291,7 +305,22 @@ func mintSentinelHeaders(ctx context.Context, scriptPath, did, flow, cookieHeade
 	return nil, lastErr
 }
 
+func sentinelFetchHelperPath() string {
+	if value := strings.TrimSpace(os.Getenv("SUB2API_SENTINEL_FETCH_HELPER")); value != "" {
+		return value
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return exe
+}
+
 func exchangeToken(ctx context.Context, code, verifier string) (map[string]any, error) {
+	return exchangeTokenWithProxy(ctx, code, verifier, "")
+}
+
+func exchangeTokenWithProxy(ctx context.Context, code, verifier string, proxyURL string) (map[string]any, error) {
 	body := url.Values{}
 	body.Set("grant_type", "authorization_code")
 	body.Set("client_id", codexClientID)
@@ -305,7 +334,15 @@ func exchangeToken(ctx context.Context, code, verifier string) (map[string]any, 
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
-	resp, err := stdhttp.DefaultClient.Do(req)
+	client := stdhttp.DefaultClient
+	if strings.TrimSpace(proxyURL) != "" {
+		proxyClient, err := newProxyHTTPClient(proxyURL, defaultHTTPTimeout)
+		if err != nil {
+			return nil, err
+		}
+		client = proxyClient
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}

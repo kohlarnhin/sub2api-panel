@@ -33,6 +33,13 @@ func NewHeroSMSClient() *HeroSMSClient {
 	return &HeroSMSClient{httpClient: &http.Client{Timeout: 30 * time.Second}}
 }
 
+func (c *HeroSMSClient) clientForProxy(proxyURL string) (*http.Client, error) {
+	if strings.TrimSpace(proxyURL) == "" {
+		return c.httpClient, nil
+	}
+	return newProxyHTTPClient(proxyURL, 30*time.Second)
+}
+
 func DefaultTemplate() HeroSMSTemplate {
 	return HeroSMSTemplate{
 		Name:           DefaultHeroSMSTemplateName,
@@ -49,7 +56,7 @@ func DefaultTemplate() HeroSMSTemplate {
 	}
 }
 
-func (c *HeroSMSClient) GetNumber(ctx context.Context, apiKey string, template HeroSMSTemplate) (map[string]any, error) {
+func (c *HeroSMSClient) GetNumber(ctx context.Context, apiKey string, template HeroSMSTemplate, proxyURL string) (map[string]any, error) {
 	apiKey = strings.TrimSpace(apiKey)
 	if apiKey == "" {
 		return nil, fmt.Errorf("HeroSMS api_key 不能为空")
@@ -81,7 +88,11 @@ func (c *HeroSMSClient) GetNumber(ctx context.Context, apiKey string, template H
 	if err != nil {
 		return nil, err
 	}
-	result, statusCode, err := doJSON(c.httpClient, req)
+	client, err := c.clientForProxy(proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	result, statusCode, err := doJSON(client, req)
 	if err != nil {
 		return nil, err
 	}
@@ -110,7 +121,7 @@ func (c *HeroSMSClient) GetNumber(ctx context.Context, apiKey string, template H
 	return result, nil
 }
 
-func (c *HeroSMSClient) GetStatus(ctx context.Context, apiKey string, activationID string) (map[string]any, error) {
+func (c *HeroSMSClient) GetStatus(ctx context.Context, apiKey string, activationID string, proxyURL string) (map[string]any, error) {
 	apiKey = strings.TrimSpace(apiKey)
 	if apiKey == "" {
 		return nil, fmt.Errorf("HeroSMS api_key 不能为空")
@@ -131,7 +142,11 @@ func (c *HeroSMSClient) GetStatus(ctx context.Context, apiKey string, activation
 	if err != nil {
 		return nil, err
 	}
-	result, statusCode, err := doJSON(c.httpClient, req)
+	client, err := c.clientForProxy(proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	result, statusCode, err := doJSON(client, req)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +163,7 @@ func (c *HeroSMSClient) GetStatus(ctx context.Context, apiKey string, activation
 	return result, nil
 }
 
-func (c *HeroSMSClient) SetStatus(ctx context.Context, apiKey string, activationID string, status int) (map[string]any, error) {
+func (c *HeroSMSClient) SetStatus(ctx context.Context, apiKey string, activationID string, status int, proxyURL string) (map[string]any, error) {
 	apiKey = strings.TrimSpace(apiKey)
 	if apiKey == "" {
 		return nil, fmt.Errorf("HeroSMS api_key 不能为空")
@@ -173,7 +188,11 @@ func (c *HeroSMSClient) SetStatus(ctx context.Context, apiKey string, activation
 	if err != nil {
 		return nil, err
 	}
-	result, statusCode, err := doJSON(c.httpClient, req)
+	client, err := c.clientForProxy(proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	result, statusCode, err := doJSON(client, req)
 	if err != nil {
 		return nil, err
 	}

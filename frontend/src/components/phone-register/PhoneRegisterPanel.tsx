@@ -100,6 +100,7 @@ type UserAccount = {
 
 type UserDashboard = {
   user: RegisterUser
+  page_config: PageConfig
   summary: UserSummary
   login_summary?: LoginSummary
   run?: UserRun
@@ -157,19 +158,29 @@ type CustomSub2APISettings = {
   proxyID: string
 }
 
+type PageConfig = {
+  herosms_api_key: string
+  duck_authorization: string
+  register_count: number
+  email_count: number
+  global_proxy: string
+  proxy_sms_enabled: boolean
+  proxy_openai_enabled: boolean
+  proxy_email_enabled: boolean
+  proxy_sub2api_enabled?: boolean
+  custom_sub2api: {
+    enabled: boolean
+    base_url: string
+    api_key: string
+    group_ids: number[]
+    proxy_id: string
+  }
+  updated_at?: string
+}
+
 const AUTHORIZATION_STORAGE = 'sub2api-panel:phone-register-authorization'
 const USERNAME_STORAGE = 'sub2api-panel:phone-register-username'
 const PASSWORD_STORAGE = 'sub2api-panel:phone-register-password'
-const HERO_KEY_STORAGE = 'sub2api-panel:herosms-api-key'
-const DUCK_AUTH_STORAGE = 'sub2api-panel:duck-authorization'
-const DUCK_PROXY_STORAGE = 'sub2api-panel:duck-proxy'
-const REGISTER_COUNT_STORAGE = 'sub2api-panel:user-register-count'
-const EMAIL_COUNT_STORAGE = 'sub2api-panel:user-email-count'
-const CUSTOM_SUB2API_ENABLED_STORAGE = 'sub2api-panel:custom-sub2api-enabled'
-const CUSTOM_SUB2API_BASE_URL_STORAGE = 'sub2api-panel:custom-sub2api-base-url'
-const CUSTOM_SUB2API_API_KEY_STORAGE = 'sub2api-panel:custom-sub2api-api-key'
-const CUSTOM_SUB2API_GROUPS_STORAGE = 'sub2api-panel:custom-sub2api-groups'
-const CUSTOM_SUB2API_PROXY_ID_STORAGE = 'sub2api-panel:custom-sub2api-proxy-id'
 const EMAIL_PAGE_SIZE = 10
 const inputClass =
   'rounded-md border border-warmgray-200 bg-white text-warmgray-900 transition-colors placeholder:text-warmgray-400 outline-none focus:border-coral-500 focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0'
@@ -294,43 +305,9 @@ function clampCount(value: string, max = 100) {
   return Math.max(1, Math.min(Number.parseInt(value, 10) || 1, max))
 }
 
-function userStorageKey(base: string, user?: RegisterUser) {
-  return user ? `${base}:${user.username}` : base
-}
-
 function usernameStorageKey(base: string, username: string) {
   const name = username.trim()
   return name ? `${base}:${name}` : base
-}
-
-function boolFromStorage(value: string | null) {
-  return value === '1' || value === 'true'
-}
-
-function customSub2APISettingsFor(username?: string): CustomSub2APISettings {
-  const userKey = (base: string) => (username ? usernameStorageKey(base, username) : base)
-  return {
-    enabled: boolFromStorage(
-      localStorage.getItem(userKey(CUSTOM_SUB2API_ENABLED_STORAGE)) ??
-        localStorage.getItem(CUSTOM_SUB2API_ENABLED_STORAGE),
-    ),
-    baseURL:
-      localStorage.getItem(userKey(CUSTOM_SUB2API_BASE_URL_STORAGE)) ||
-      localStorage.getItem(CUSTOM_SUB2API_BASE_URL_STORAGE) ||
-      '',
-    apiKey:
-      localStorage.getItem(userKey(CUSTOM_SUB2API_API_KEY_STORAGE)) ||
-      localStorage.getItem(CUSTOM_SUB2API_API_KEY_STORAGE) ||
-      '',
-    groupIDs:
-      localStorage.getItem(userKey(CUSTOM_SUB2API_GROUPS_STORAGE)) ||
-      localStorage.getItem(CUSTOM_SUB2API_GROUPS_STORAGE) ||
-      '',
-    proxyID:
-      localStorage.getItem(userKey(CUSTOM_SUB2API_PROXY_ID_STORAGE)) ||
-      localStorage.getItem(CUSTOM_SUB2API_PROXY_ID_STORAGE) ||
-      '',
-  }
 }
 
 function parseGroupIDs(value: string) {
@@ -348,22 +325,39 @@ function parseGroupIDs(value: string) {
   return ids
 }
 
-function saveCustomSub2APISettings(settings: CustomSub2APISettings, user?: RegisterUser) {
-  const enabled = settings.enabled ? '1' : '0'
-  const normalizedGroups = parseGroupIDs(settings.groupIDs).join(',')
-  const pairs = [
-    [CUSTOM_SUB2API_ENABLED_STORAGE, enabled],
-    [CUSTOM_SUB2API_BASE_URL_STORAGE, settings.baseURL.trim()],
-    [CUSTOM_SUB2API_API_KEY_STORAGE, settings.apiKey.trim()],
-    [CUSTOM_SUB2API_GROUPS_STORAGE, normalizedGroups],
-    [CUSTOM_SUB2API_PROXY_ID_STORAGE, settings.proxyID.trim()],
-  ] as const
-  pairs.forEach(([key, value]) => {
-    localStorage.setItem(key, value)
-    if (user) {
-      localStorage.setItem(userStorageKey(key, user), value)
-    }
-  })
+function defaultPageConfig(): PageConfig {
+  return {
+    herosms_api_key: '',
+    duck_authorization: '',
+    register_count: 1,
+    email_count: 1,
+    global_proxy: '',
+    proxy_sms_enabled: false,
+    proxy_openai_enabled: false,
+    proxy_email_enabled: false,
+    proxy_sub2api_enabled: false,
+    custom_sub2api: {
+      enabled: false,
+      base_url: '',
+      api_key: '',
+      group_ids: [],
+      proxy_id: '',
+    },
+  }
+}
+
+function pageConfigFromDashboard(data?: UserDashboard | null): PageConfig {
+  return data?.page_config ?? defaultPageConfig()
+}
+
+function customSettingsFromPageConfig(config: PageConfig): CustomSub2APISettings {
+  return {
+    enabled: !!config.custom_sub2api?.enabled,
+    baseURL: config.custom_sub2api?.base_url || '',
+    apiKey: config.custom_sub2api?.api_key || '',
+    groupIDs: (config.custom_sub2api?.group_ids || []).join(','),
+    proxyID: config.custom_sub2api?.proxy_id || '',
+  }
 }
 
 function percent(done: number, total: number) {
@@ -417,31 +411,20 @@ export function PhoneRegisterPanel() {
   const [loginPassword, setLoginPassword] = useState(
     () => localStorage.getItem(PASSWORD_STORAGE) || '',
   )
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem(HERO_KEY_STORAGE) || '')
-  const [duckAuth, setDuckAuth] = useState(() => localStorage.getItem(DUCK_AUTH_STORAGE) || '')
-    const [duckProxy, setDuckProxy] = useState(() => localStorage.getItem(DUCK_PROXY_STORAGE) || '')
-  const [registerCount, setRegisterCount] = useState(
-    () => localStorage.getItem(REGISTER_COUNT_STORAGE) || '1',
-  )
-  const [emailCount, setEmailCount] = useState(() => localStorage.getItem(EMAIL_COUNT_STORAGE) || '1')
-  const [customSub2APIEnabled, setCustomSub2APIEnabled] = useState(
-    () => customSub2APISettingsFor().enabled,
-  )
-  const [customSub2APICollapsed, setCustomSub2APICollapsed] = useState(
-    () => !customSub2APISettingsFor().enabled,
-  )
-  const [customSub2APIBaseURL, setCustomSub2APIBaseURL] = useState(
-    () => customSub2APISettingsFor().baseURL,
-  )
-  const [customSub2APIKey, setCustomSub2APIKey] = useState(
-    () => customSub2APISettingsFor().apiKey,
-  )
-  const [customSub2APIGroups, setCustomSub2APIGroups] = useState(
-    () => customSub2APISettingsFor().groupIDs,
-  )
-  const [customSub2APIProxyID, setCustomSub2APIProxyID] = useState(
-    () => customSub2APISettingsFor().proxyID,
-  )
+  const [apiKey, setApiKey] = useState('')
+  const [duckAuth, setDuckAuth] = useState('')
+  const [globalProxy, setGlobalProxy] = useState('')
+  const [proxySMSEnabled, setProxySMSEnabled] = useState(false)
+  const [proxyOpenAIEnabled, setProxyOpenAIEnabled] = useState(false)
+  const [proxyEmailEnabled, setProxyEmailEnabled] = useState(false)
+  const [registerCount, setRegisterCount] = useState('1')
+  const [emailCount, setEmailCount] = useState('1')
+  const [customSub2APIEnabled, setCustomSub2APIEnabled] = useState(false)
+  const [customSub2APICollapsed, setCustomSub2APICollapsed] = useState(true)
+  const [customSub2APIBaseURL, setCustomSub2APIBaseURL] = useState('')
+  const [customSub2APIKey, setCustomSub2APIKey] = useState('')
+  const [customSub2APIGroups, setCustomSub2APIGroups] = useState('')
+  const [customSub2APIProxyID, setCustomSub2APIProxyID] = useState('')
   const [dashboard, setDashboard] = useState<UserDashboard | null>(null)
   // booting：有缓存会话时，先显示加载视图自动恢复，避免切回本页时闪现登录表单。
   const [booting, setBooting] = useState(
@@ -529,6 +512,92 @@ export function PhoneRegisterPanel() {
     setMessage(err instanceof Error ? err.message : String(err))
     setMessageType('error')
   }, [])
+
+  const applyPageConfig = useCallback((config: PageConfig) => {
+    const normalized = config || defaultPageConfig()
+    const customSettings = customSettingsFromPageConfig(normalized)
+    setApiKey(normalized.herosms_api_key || '')
+    setDuckAuth(normalized.duck_authorization || '')
+    setGlobalProxy(normalized.global_proxy || '')
+    setProxySMSEnabled(!!normalized.proxy_sms_enabled)
+    setProxyOpenAIEnabled(!!normalized.proxy_openai_enabled)
+    setProxyEmailEnabled(!!normalized.proxy_email_enabled)
+    setRegisterCount(String(normalized.register_count || 1))
+    setEmailCount(String(normalized.email_count || 1))
+    setCustomSub2APIEnabled(customSettings.enabled)
+    setCustomSub2APICollapsed(!customSettings.enabled)
+    setCustomSub2APIBaseURL(customSettings.baseURL)
+    setCustomSub2APIKey(customSettings.apiKey)
+    setCustomSub2APIGroups(customSettings.groupIDs)
+    setCustomSub2APIProxyID(customSettings.proxyID)
+  }, [])
+
+  const currentPageConfig = useCallback((): PageConfig => {
+    const registerTarget = clampCount(registerCount, 100)
+    const emailTarget = clampCount(emailCount, 50)
+    const groupIDs = parseGroupIDs(customSub2APIGroups)
+    return {
+      herosms_api_key: apiKey.trim(),
+      duck_authorization: duckAuth.trim(),
+      register_count: registerTarget,
+      email_count: emailTarget,
+      global_proxy: globalProxy.trim(),
+      proxy_sms_enabled: proxySMSEnabled,
+      proxy_openai_enabled: proxyOpenAIEnabled,
+      proxy_email_enabled: proxyEmailEnabled,
+      proxy_sub2api_enabled: false,
+      custom_sub2api: {
+        enabled: customSub2APIEnabled,
+        base_url: customSub2APIBaseURL.trim(),
+        api_key: customSub2APIKey.trim(),
+        group_ids: groupIDs,
+        proxy_id: customSub2APIProxyID.trim(),
+      },
+    }
+  }, [
+    apiKey,
+    duckAuth,
+    registerCount,
+    emailCount,
+    globalProxy,
+    proxySMSEnabled,
+    proxyOpenAIEnabled,
+    proxyEmailEnabled,
+    customSub2APIEnabled,
+    customSub2APIBaseURL,
+    customSub2APIKey,
+    customSub2APIGroups,
+    customSub2APIProxyID,
+  ])
+
+  const savePageConfig = useCallback(
+    async (showMessage = true) => {
+      if (!user) return null
+      const payload = currentPageConfig()
+      const proxyEnabled =
+        payload.proxy_sms_enabled ||
+        payload.proxy_openai_enabled ||
+        payload.proxy_email_enabled
+      if (proxyEnabled && !payload.global_proxy) {
+        throw new Error('请先填写页面全局代理地址，或关闭代理开关')
+      }
+      const data = await requestJSON<UserDashboard>('/api/phone-register/user/page-config', {
+        method: 'POST',
+        body: JSON.stringify({
+          user_id: user.id,
+          page_config: payload,
+        }),
+      })
+      setDashboard(data)
+      applyPageConfig(pageConfigFromDashboard(data))
+      if (showMessage) {
+        setMessage('页面配置已保存')
+        setMessageType('ok')
+      }
+      return data
+    },
+    [applyPageConfig, currentPageConfig, user],
+  )
 
   const refreshEmails = useCallback(async (userID: number, page = emailPageRef.current, query = emailQueryRef.current) => {
     setEmailLoading(true)
@@ -670,20 +739,8 @@ export function PhoneRegisterPanel() {
       localStorage.setItem(PASSWORD_STORAGE, password)
       localStorage.setItem(usernameStorageKey(PASSWORD_STORAGE, name), password)
       setDashboard(data)
+      applyPageConfig(pageConfigFromDashboard(data))
       emailRefreshSnapshotRef.current = emailRefreshSnapshot(data)
-      setApiKey(localStorage.getItem(userStorageKey(HERO_KEY_STORAGE, data.user)) || '')
-      setDuckAuth(localStorage.getItem(userStorageKey(DUCK_AUTH_STORAGE, data.user)) || '')
-      setRegisterCount(
-        localStorage.getItem(userStorageKey(REGISTER_COUNT_STORAGE, data.user)) || '1',
-      )
-      setEmailCount(localStorage.getItem(userStorageKey(EMAIL_COUNT_STORAGE, data.user)) || '1')
-      const customSettings = customSub2APISettingsFor(data.user.username)
-      setCustomSub2APIEnabled(customSettings.enabled)
-      setCustomSub2APICollapsed(!customSettings.enabled)
-      setCustomSub2APIBaseURL(customSettings.baseURL)
-      setCustomSub2APIKey(customSettings.apiKey)
-      setCustomSub2APIGroups(customSettings.groupIDs)
-      setCustomSub2APIProxyID(customSettings.proxyID)
       setLoginPassword(password)
       setOtpEmail(data.user.otp_email || '')
       setNewPassword('')
@@ -734,15 +791,8 @@ export function PhoneRegisterPanel() {
     setMessage(`正在创建 ${count} 个 Duck 邮箱...`)
     setMessageType('info')
     try {
+      await savePageConfig(false)
       scheduleRefresh(user.id)
-      localStorage.setItem(EMAIL_COUNT_STORAGE, String(count))
-      localStorage.setItem(userStorageKey(EMAIL_COUNT_STORAGE, user), String(count))
-      if (user.is_duck) {
-        localStorage.setItem(DUCK_AUTH_STORAGE, duckAuth.trim())
-        localStorage.setItem(userStorageKey(DUCK_AUTH_STORAGE, user), duckAuth.trim())
-        localStorage.setItem(DUCK_PROXY_STORAGE, duckProxy.trim())
-        localStorage.setItem(userStorageKey(DUCK_PROXY_STORAGE, user), duckProxy.trim())
-      }
       const result = await requestJSON<EmailGenerateResult>(
         '/api/phone-register/user/emails/generate',
         {
@@ -751,7 +801,6 @@ export function PhoneRegisterPanel() {
             user_id: user.id,
             count,
             duck_authorization: duckAuth.trim(),
-            proxy: duckProxy.trim(),
           }),
         },
       )
@@ -823,24 +872,15 @@ export function PhoneRegisterPanel() {
     setMessage(`正在启动 ${count} 个账号的注册任务...`)
     setMessageType('info')
     try {
-      localStorage.setItem(HERO_KEY_STORAGE, apiKey.trim())
-      localStorage.setItem(REGISTER_COUNT_STORAGE, String(count))
-      localStorage.setItem(userStorageKey(HERO_KEY_STORAGE, user), apiKey.trim())
-      localStorage.setItem(userStorageKey(REGISTER_COUNT_STORAGE, user), String(count))
-      const customSettings = {
-        enabled: customSub2APIEnabled,
-        baseURL: customSub2APIBaseURL,
-        apiKey: customSub2APIKey,
-        groupIDs: customSub2APIGroups,
-        proxyID: customSub2APIProxyID,
-      }
-      saveCustomSub2APISettings(customSettings, user)
+      const pageConfig = currentPageConfig()
+      await savePageConfig(false)
       const data = await requestJSON<UserDashboard>('/api/phone-register/user/register/start', {
         method: 'POST',
         body: JSON.stringify({
           user_id: user.id,
           api_key: apiKey.trim(),
           count,
+          page_config: pageConfig,
           custom_sub2api: customSub2APIEnabled
             ? {
                 enabled: true,
@@ -899,14 +939,8 @@ export function PhoneRegisterPanel() {
     setMessage(`正在上传 ${item.email} 到 Sub2API...`)
     setMessageType('info')
     try {
-      const customSettings = {
-        enabled: customSub2APIEnabled,
-        baseURL: customSub2APIBaseURL,
-        apiKey: customSub2APIKey,
-        groupIDs: customSub2APIGroups,
-        proxyID: customSub2APIProxyID,
-      }
-      saveCustomSub2APISettings(customSettings, user)
+      const pageConfig = currentPageConfig()
+      await savePageConfig(false)
       const result = await requestJSON<{ upload_target?: string }>(
         '/api/phone-register/user/accounts/sub2api/upload',
         {
@@ -914,6 +948,7 @@ export function PhoneRegisterPanel() {
           body: JSON.stringify({
             user_id: user.id,
             account_id: item.account_id,
+            page_config: pageConfig,
             custom_sub2api: customSub2APIEnabled
               ? {
                   enabled: true,
@@ -989,6 +1024,19 @@ export function PhoneRegisterPanel() {
     }
   }
 
+  const savePageConfigFromButton = async () => {
+    setLoading(true)
+    setMessage('正在保存页面配置...')
+    setMessageType('info')
+    try {
+      await savePageConfig(true)
+    } catch (err) {
+      renderError(err)
+    } finally {
+      setLoading(false)
+    }
+  }
+
   const saveUserInfo = async () => {
     if (!user) return
     const nextOtpEmail = otpEmail.trim()
@@ -1015,7 +1063,7 @@ export function PhoneRegisterPanel() {
       setOtpEmail(data.user.otp_email || '')
       if (nextPassword) {
         localStorage.setItem(PASSWORD_STORAGE, nextPassword)
-        localStorage.setItem(userStorageKey(PASSWORD_STORAGE, data.user), nextPassword)
+        localStorage.setItem(usernameStorageKey(PASSWORD_STORAGE, data.user.username), nextPassword)
         setLoginPassword(nextPassword)
         setNewPassword('')
       }
@@ -1187,10 +1235,48 @@ export function PhoneRegisterPanel() {
               ) : null}
             </ControlGroup>
 
+            <ControlGroup
+              title="页面代理"
+              description="同一个代理地址可分别作用于短信验证、OpenAI 和邮箱请求。"
+            >
+              <label className="grid gap-1.5 text-[12px] font-medium text-warmgray-600">
+                全局代理地址
+                <input
+                  className={`${inputClass} h-10 px-3 text-[13px]`}
+                  type="text"
+                  value={globalProxy}
+                  onChange={(event) => setGlobalProxy(event.target.value)}
+                  disabled={loading || isRunning || isEmailGenerating}
+                  autoComplete="off"
+                  placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:7890"
+                />
+              </label>
+              <div className="mt-3 grid gap-2">
+                <ProxyToggle
+                  label="SMS 短信验证"
+                  checked={proxySMSEnabled}
+                  onChange={setProxySMSEnabled}
+                  disabled={loading || isRunning}
+                />
+                <ProxyToggle
+                  label="OpenAI"
+                  checked={proxyOpenAIEnabled}
+                  onChange={setProxyOpenAIEnabled}
+                  disabled={loading || isRunning}
+                />
+                <ProxyToggle
+                  label="邮箱"
+                  checked={proxyEmailEnabled}
+                  onChange={setProxyEmailEnabled}
+                  disabled={loading || isRunning || isEmailGenerating}
+                />
+              </div>
+            </ControlGroup>
+
             {user?.is_duck ? (
               <ControlGroup
                 title="Duck 邮箱"
-                description="Authorization 会缓存在当前浏览器。"
+                description="Authorization 会随页面配置保存到数据库。"
                 side={
                   <input
                     className={`${inputClass} h-9 w-20 px-2 text-[13px]`}
@@ -1213,18 +1299,6 @@ export function PhoneRegisterPanel() {
                     disabled={loading || isEmailGenerating}
                     autoComplete="off"
                     placeholder="不需要输入 Bearer"
-                  />
-                </label>
-                <label className="grid gap-1.5 text-[12px] font-medium text-warmgray-600">
-                  代理地址（可选）
-                  <input
-                    className={`${inputClass} h-10 px-3 text-[13px]`}
-                    type="text"
-                    value={duckProxy}
-                    onChange={(event) => setDuckProxy(event.target.value)}
-                    disabled={loading || isEmailGenerating}
-                    autoComplete="off"
-                    placeholder="http://127.0.0.1:7890"
                   />
                 </label>
                 <button
@@ -1268,7 +1342,7 @@ export function PhoneRegisterPanel() {
                   onChange={(event) => setApiKey(event.target.value)}
                   disabled={loading || isRunning}
                   autoComplete="off"
-                  placeholder="不同使用者可各自缓存"
+                  placeholder="不同使用者会读取各自数据库配置"
                 />
               </label>
               <div className="mt-3 rounded-xl border border-warmgray-200 bg-white px-3 py-3">
@@ -1376,6 +1450,15 @@ export function PhoneRegisterPanel() {
               </div>
             </ControlGroup>
 
+            <button
+              className="h-11 w-full rounded-md border border-coral-200 bg-coral-50 px-4 text-[13px] font-semibold text-coral-700 transition-colors hover:bg-coral-100 disabled:cursor-not-allowed disabled:opacity-50"
+              type="button"
+              onClick={() => void savePageConfigFromButton()}
+              disabled={loading || isRunning || isEmailGenerating}
+            >
+              保存全部页面配置
+            </button>
+
             <MessageLine message={message} type={messageType} />
           </div>
         </div>
@@ -1463,6 +1546,41 @@ function ControlGroup({
       </div>
       {children}
     </div>
+  )
+}
+
+function ProxyToggle({
+  label,
+  checked,
+  disabled,
+  onChange,
+}: {
+  label: string
+  checked: boolean
+  disabled?: boolean
+  onChange: (checked: boolean) => void
+}) {
+  return (
+    <button
+      type="button"
+      className="flex h-10 items-center justify-between rounded-md border border-warmgray-200 bg-white px-3 text-left transition-colors hover:bg-warmgray-50 disabled:cursor-not-allowed disabled:opacity-50"
+      onClick={() => onChange(!checked)}
+      disabled={disabled}
+      aria-pressed={checked}
+    >
+      <span className="text-[12px] font-semibold text-warmgray-700">{label}</span>
+      <span
+        className={`relative h-5 w-9 rounded-full transition-colors ${
+          checked ? 'bg-coral-500' : 'bg-warmgray-200'
+        }`}
+      >
+        <span
+          className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow-soft transition-transform ${
+            checked ? 'translate-x-[18px]' : 'translate-x-0.5'
+          }`}
+        />
+      </span>
+    </button>
   )
 }
 

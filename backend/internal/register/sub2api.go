@@ -24,6 +24,7 @@ const (
 type Sub2APIClient struct {
 	baseURL    string
 	apiKey     string
+	proxyURL   string
 	httpClient *http.Client
 }
 
@@ -33,6 +34,15 @@ func NewSub2APIClient(baseURL, apiKey string) *Sub2APIClient {
 		apiKey:     strings.TrimSpace(apiKey),
 		httpClient: &http.Client{Timeout: defaultTimeout},
 	}
+}
+
+func (c *Sub2APIClient) WithProxy(proxyURL string) *Sub2APIClient {
+	if c == nil {
+		return c
+	}
+	clone := *c
+	clone.proxyURL = strings.TrimSpace(proxyURL)
+	return &clone
 }
 
 func (c *Sub2APIClient) Upload(ctx context.Context, payload map[string]any) (map[string]any, error) {
@@ -58,7 +68,15 @@ func (c *Sub2APIClient) Upload(ctx context.Context, payload map[string]any) (map
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-api-key", c.apiKey)
 
-	resp, err := c.httpClient.Do(req)
+	client := c.httpClient
+	if c.proxyURL != "" {
+		proxyClient, err := newProxyHTTPClient(c.proxyURL, defaultTimeout)
+		if err != nil {
+			return nil, err
+		}
+		client = proxyClient
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("Sub2API 上传失败: %w", err)
 	}

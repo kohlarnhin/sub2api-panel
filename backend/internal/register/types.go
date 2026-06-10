@@ -60,6 +60,7 @@ type UserSub2APIUploadRequest struct {
 	UserID        int64                `json:"user_id" binding:"required"`
 	AccountID     int64                `json:"account_id" binding:"required"`
 	CustomSub2API *CustomSub2APIConfig `json:"custom_sub2api,omitempty"`
+	PageConfig    *UserPageConfig      `json:"page_config,omitempty"`
 }
 
 type UserRegisterStartRequest struct {
@@ -67,6 +68,7 @@ type UserRegisterStartRequest struct {
 	APIKey        string               `json:"api_key" binding:"required"`
 	Count         int                  `json:"count"`
 	CustomSub2API *CustomSub2APIConfig `json:"custom_sub2api,omitempty"`
+	PageConfig    *UserPageConfig      `json:"page_config,omitempty"`
 }
 
 type CustomSub2APIConfig struct {
@@ -75,6 +77,25 @@ type CustomSub2APIConfig struct {
 	APIKey   string  `json:"api_key"`
 	GroupIDs []int64 `json:"group_ids"`
 	ProxyID  string  `json:"proxy_id"`
+}
+
+type UserPageConfigRequest struct {
+	UserID     int64           `json:"user_id" binding:"required"`
+	PageConfig *UserPageConfig `json:"page_config" binding:"required"`
+}
+
+type UserPageConfig struct {
+	HeroSMSAPIKey       string              `json:"herosms_api_key"`
+	DuckAuthorization   string              `json:"duck_authorization"`
+	RegisterCount       int                 `json:"register_count"`
+	EmailCount          int                 `json:"email_count"`
+	GlobalProxy         string              `json:"global_proxy"`
+	ProxySMSEnabled     bool                `json:"proxy_sms_enabled"`
+	ProxyOpenAIEnabled  bool                `json:"proxy_openai_enabled"`
+	ProxyEmailEnabled   bool                `json:"proxy_email_enabled"`
+	ProxySub2APIEnabled bool                `json:"proxy_sub2api_enabled"`
+	CustomSub2API       CustomSub2APIConfig `json:"custom_sub2api"`
+	UpdatedAt           time.Time           `json:"updated_at"`
 }
 
 type StopRequest struct {
@@ -281,12 +302,13 @@ type UserRun struct {
 }
 
 type UserDashboard struct {
-	User           RegisterUser  `json:"user"`
-	Summary        UserSummary   `json:"summary"`
-	LoginSummary   LoginSummary  `json:"login_summary"`
-	Run            *UserRun      `json:"run,omitempty"`
-	EmailRun       *UserEmailRun `json:"email_run,omitempty"`
-	LatestAccounts []UserAccount `json:"latest_accounts"`
+	User           RegisterUser   `json:"user"`
+	PageConfig     UserPageConfig `json:"page_config"`
+	Summary        UserSummary    `json:"summary"`
+	LoginSummary   LoginSummary   `json:"login_summary"`
+	Run            *UserRun       `json:"run,omitempty"`
+	EmailRun       *UserEmailRun  `json:"email_run,omitempty"`
+	LatestAccounts []UserAccount  `json:"latest_accounts"`
 }
 
 type UserEmailGenerateResult struct {

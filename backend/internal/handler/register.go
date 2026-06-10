@@ -62,6 +62,20 @@ func (h *RegisterHandler) UpdateUser(c *gin.Context) {
 	c.JSON(http.StatusOK, dashboard)
 }
 
+func (h *RegisterHandler) SaveUserPageConfig(c *gin.Context) {
+	var payload register.UserPageConfigRequest
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	dashboard, err := h.svc.SaveUserPageConfig(c.Request.Context(), payload)
+	if err != nil {
+		c.JSON(statusForRegisterError(err), gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, dashboard)
+}
+
 func (h *RegisterHandler) UserEmails(c *gin.Context) {
 	userID, ok := bindInt64Param(c, "user_id")
 	if !ok {

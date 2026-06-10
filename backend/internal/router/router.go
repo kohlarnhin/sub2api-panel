@@ -58,6 +58,7 @@ func New(svc *stats.Service, registerSvc *register.Service, sseInterval time.Dur
 	phone.GET("/template", registerH.Template)
 	phone.POST("/user/login", registerH.LoginUser)
 	phone.POST("/user/update", registerH.UpdateUser)
+	phone.POST("/user/page-config", registerH.SaveUserPageConfig)
 	phone.GET("/users/:user_id/dashboard", registerH.UserDashboard)
 	phone.GET("/users/:user_id/emails", registerH.UserEmails)
 	phone.POST("/user/emails/generate", registerH.GenerateUserEmails)

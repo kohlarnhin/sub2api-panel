@@ -20,6 +20,10 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "sentinel-fetch" {
+		os.Exit(register.RunSentinelFetchCLI(context.Background(), os.Stdin, os.Stdout, os.Stderr))
+	}
+
 	configPath := flag.String("config", "config.yaml", "path to config file")
 	staticPath := flag.String("static", "", "path to frontend dist directory")
 	flag.Parse()

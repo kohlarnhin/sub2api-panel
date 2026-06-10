@@ -3,17 +3,13 @@ package register
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"regexp"
 	"strings"
 	"time"
-
-	"golang.org/x/net/proxy"
 )
 
 const duckEmailEndpoint = "https://quack.duckduckgo.com/api/email/addresses"
@@ -26,48 +22,6 @@ type DuckClient struct {
 
 func NewDuckClient() *DuckClient {
 	return &DuckClient{httpClient: &http.Client{Timeout: 30 * time.Second}}
-}
-
-// newDuckHTTPClient 根据代理地址创建 http.Client。
-// proxy 为空时返回默认直连 Client；支持 http/https/socks5 协议。
-func newDuckHTTPClient(proxyURL string) (*http.Client, error) {
-	if proxyURL = strings.TrimSpace(proxyURL); proxyURL == "" {
-		return &http.Client{Timeout: 30 * time.Second}, nil
-	}
-	parsed, err := url.Parse(proxyURL)
-	if err != nil {
-		return nil, fmt.Errorf("代理地址格式错误: %w", err)
-	}
-	scheme := strings.ToLower(parsed.Scheme)
-	switch scheme {
-	case "http", "https":
-		transport := &http.Transport{
-			Proxy:                 http.ProxyURL(parsed),
-			TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		}
-		return &http.Client{Timeout: 30 * time.Second, Transport: transport}, nil
-	case "socks5":
-		dialer, err := proxy.FromURL(parsed, proxy.Direct)
-		if err != nil {
-			return nil, fmt.Errorf("socks5 代理初始化失败: %w", err)
-		}
-		contextDialer, ok := dialer.(proxy.ContextDialer)
-		if !ok {
-			return nil, fmt.Errorf("socks5 代理不支持 Context 拨号")
-		}
-		transport := &http.Transport{
-			DialContext:           contextDialer.DialContext,
-			TLSClientConfig:      &tls.Config{MinVersion: tls.VersionTLS12},
-			IdleConnTimeout:      90 * time.Second,
-			TLSHandshakeTimeout:  10 * time.Second,
-		}
-		return &http.Client{Timeout: 30 * time.Second, Transport: transport}, nil
-	default:
-		return nil, fmt.Errorf("不支持的代理协议: %s（支持 http/https/socks5）", scheme)
-	}
 }
 
 func (c *DuckClient) CreateEmail(ctx context.Context, authorization string, proxyURL string) (string, map[string]any, error) {
@@ -96,7 +50,7 @@ func (c *DuckClient) CreateEmail(ctx context.Context, authorization string, prox
 	// 根据代理配置创建 HTTP Client
 	client := c.httpClient
 	if proxyURL != "" {
-		proxyClient, err := newDuckHTTPClient(proxyURL)
+		proxyClient, err := newProxyHTTPClient(proxyURL, 30*time.Second)
 		if err != nil {
 			return "", nil, err
 		}

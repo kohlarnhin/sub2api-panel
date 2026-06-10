@@ -13,6 +13,11 @@ FROM golang:1.24-alpine AS backend-builder
 
 WORKDIR /src/backend
 
+ARG GOPROXY=https://goproxy.cn,direct
+ARG GOSUMDB=sum.golang.google.cn
+ENV GOPROXY=${GOPROXY} \
+    GOSUMDB=${GOSUMDB}
+
 COPY backend/go.mod backend/go.sum ./
 RUN go mod download
 

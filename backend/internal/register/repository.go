@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -70,6 +71,41 @@ func (r *Repository) EnsureSchema(ctx context.Context) error {
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)
 		`,
+		`
+		CREATE TABLE IF NOT EXISTS register_user_page_config (
+			user_id BIGINT PRIMARY KEY REFERENCES register_users(id) ON DELETE CASCADE,
+			herosms_api_key TEXT NOT NULL DEFAULT '',
+			duck_authorization TEXT NOT NULL DEFAULT '',
+			register_count INT NOT NULL DEFAULT 1,
+			email_count INT NOT NULL DEFAULT 1,
+			global_proxy TEXT NOT NULL DEFAULT '',
+			proxy_sms_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+			proxy_openai_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+			proxy_email_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+			proxy_sub2api_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+			custom_sub2api_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+			custom_sub2api_base_url TEXT NOT NULL DEFAULT '',
+			custom_sub2api_api_key TEXT NOT NULL DEFAULT '',
+			custom_sub2api_group_ids TEXT NOT NULL DEFAULT '[]',
+			custom_sub2api_proxy_id TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)
+		`,
+		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS herosms_api_key TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS duck_authorization TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS register_count INT NOT NULL DEFAULT 1`,
+		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS email_count INT NOT NULL DEFAULT 1`,
+		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS global_proxy TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS proxy_sms_enabled BOOLEAN NOT NULL DEFAULT FALSE`,
+		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS proxy_openai_enabled BOOLEAN NOT NULL DEFAULT FALSE`,
+		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS proxy_email_enabled BOOLEAN NOT NULL DEFAULT FALSE`,
+		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS proxy_sub2api_enabled BOOLEAN NOT NULL DEFAULT FALSE`,
+		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS custom_sub2api_enabled BOOLEAN NOT NULL DEFAULT FALSE`,
+		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS custom_sub2api_base_url TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS custom_sub2api_api_key TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS custom_sub2api_group_ids TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS custom_sub2api_proxy_id TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_user_email_user_unused ON user_email(user_id, used_at, id)`,
 		`CREATE INDEX IF NOT EXISTS idx_user_phone_accounts_user_status ON user_phone_accounts(user_id, status, id)`,
 		`CREATE INDEX IF NOT EXISTS idx_user_phone_accounts_phone ON user_phone_accounts(phone)`,
@@ -121,6 +157,129 @@ func (r *Repository) GetRegisterUserByID(ctx context.Context, userID int64) (*Re
 		return nil, fmt.Errorf("query register_users by id: %w", err)
 	}
 	return &user, nil
+}
+
+func (r *Repository) GetUserPageConfig(ctx context.Context, userID int64) (UserPageConfig, error) {
+	if userID <= 0 {
+		return UserPageConfig{}, fmt.Errorf("user_id 无效")
+	}
+	config := defaultUserPageConfig()
+	const q = `
+		SELECT
+			COALESCE(herosms_api_key, ''),
+			COALESCE(duck_authorization, ''),
+			register_count,
+			email_count,
+			COALESCE(global_proxy, ''),
+			proxy_sms_enabled,
+			proxy_openai_enabled,
+			proxy_email_enabled,
+			proxy_sub2api_enabled,
+			custom_sub2api_enabled,
+			COALESCE(custom_sub2api_base_url, ''),
+			COALESCE(custom_sub2api_api_key, ''),
+			COALESCE(custom_sub2api_group_ids, '[]'),
+			COALESCE(custom_sub2api_proxy_id, ''),
+			updated_at
+		FROM register_user_page_config
+		WHERE user_id = $1
+		LIMIT 1
+	`
+	groupIDsRaw := "[]"
+	if err := r.db.QueryRowContext(ctx, q, userID).Scan(
+		&config.HeroSMSAPIKey,
+		&config.DuckAuthorization,
+		&config.RegisterCount,
+		&config.EmailCount,
+		&config.GlobalProxy,
+		&config.ProxySMSEnabled,
+		&config.ProxyOpenAIEnabled,
+		&config.ProxyEmailEnabled,
+		&config.ProxySub2APIEnabled,
+		&config.CustomSub2API.Enabled,
+		&config.CustomSub2API.BaseURL,
+		&config.CustomSub2API.APIKey,
+		&groupIDsRaw,
+		&config.CustomSub2API.ProxyID,
+		&config.UpdatedAt,
+	); err != nil {
+		if err == sql.ErrNoRows {
+			return config, nil
+		}
+		return config, fmt.Errorf("query user page config: %w", err)
+	}
+	config.CustomSub2API.GroupIDs = parseConfigGroupIDs(groupIDsRaw)
+	return normalizeUserPageConfig(config), nil
+}
+
+func (r *Repository) SaveUserPageConfig(ctx context.Context, userID int64, config UserPageConfig) (UserPageConfig, error) {
+	if userID <= 0 {
+		return UserPageConfig{}, fmt.Errorf("user_id 无效")
+	}
+	config = normalizeUserPageConfig(config)
+	groupIDsRaw := "[]"
+	if b, err := json.Marshal(positiveGroupIDs(config.CustomSub2API.GroupIDs)); err == nil {
+		groupIDsRaw = string(b)
+	}
+	const q = `
+		INSERT INTO register_user_page_config (
+			user_id,
+			herosms_api_key,
+			duck_authorization,
+			register_count,
+			email_count,
+			global_proxy,
+			proxy_sms_enabled,
+			proxy_openai_enabled,
+			proxy_email_enabled,
+			proxy_sub2api_enabled,
+			custom_sub2api_enabled,
+			custom_sub2api_base_url,
+			custom_sub2api_api_key,
+			custom_sub2api_group_ids,
+			custom_sub2api_proxy_id
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		ON CONFLICT (user_id) DO UPDATE
+		SET herosms_api_key = EXCLUDED.herosms_api_key,
+		    duck_authorization = EXCLUDED.duck_authorization,
+		    register_count = EXCLUDED.register_count,
+		    email_count = EXCLUDED.email_count,
+		    global_proxy = EXCLUDED.global_proxy,
+		    proxy_sms_enabled = EXCLUDED.proxy_sms_enabled,
+		    proxy_openai_enabled = EXCLUDED.proxy_openai_enabled,
+		    proxy_email_enabled = EXCLUDED.proxy_email_enabled,
+		    proxy_sub2api_enabled = EXCLUDED.proxy_sub2api_enabled,
+		    custom_sub2api_enabled = EXCLUDED.custom_sub2api_enabled,
+		    custom_sub2api_base_url = EXCLUDED.custom_sub2api_base_url,
+		    custom_sub2api_api_key = EXCLUDED.custom_sub2api_api_key,
+		    custom_sub2api_group_ids = EXCLUDED.custom_sub2api_group_ids,
+		    custom_sub2api_proxy_id = EXCLUDED.custom_sub2api_proxy_id,
+		    updated_at = NOW()
+		RETURNING updated_at
+	`
+	if err := r.db.QueryRowContext(
+		ctx,
+		q,
+		userID,
+		config.HeroSMSAPIKey,
+		config.DuckAuthorization,
+		config.RegisterCount,
+		config.EmailCount,
+		config.GlobalProxy,
+		config.ProxySMSEnabled,
+		config.ProxyOpenAIEnabled,
+		config.ProxyEmailEnabled,
+		config.ProxySub2APIEnabled,
+		config.CustomSub2API.Enabled,
+		config.CustomSub2API.BaseURL,
+		config.CustomSub2API.APIKey,
+		groupIDsRaw,
+		config.CustomSub2API.ProxyID,
+	).Scan(&config.UpdatedAt); err != nil {
+		return UserPageConfig{}, fmt.Errorf("save user page config: %w", err)
+	}
+	return config, nil
 }
 
 func (r *Repository) UpdateRegisterUser(ctx context.Context, userID int64, otpEmail, password string) (*RegisterUser, error) {
@@ -710,6 +869,73 @@ func (r *Repository) ListUserEmails(ctx context.Context, userID int64, page, pag
 func normalizePhoneSearch(value string) string {
 	replacer := strings.NewReplacer("+", "", "(", "", ")", "", " ", "", "-", "")
 	return replacer.Replace(strings.TrimSpace(value))
+}
+
+func defaultUserPageConfig() UserPageConfig {
+	return UserPageConfig{
+		RegisterCount: 1,
+		EmailCount:    1,
+		CustomSub2API: CustomSub2APIConfig{GroupIDs: []int64{}},
+	}
+}
+
+func normalizeUserPageConfig(config UserPageConfig) UserPageConfig {
+	config.HeroSMSAPIKey = strings.TrimSpace(config.HeroSMSAPIKey)
+	config.DuckAuthorization = strings.TrimSpace(config.DuckAuthorization)
+	config.GlobalProxy = strings.TrimSpace(config.GlobalProxy)
+	if config.RegisterCount <= 0 {
+		config.RegisterCount = 1
+	}
+	if config.RegisterCount > maxHeroSMSBatchCount {
+		config.RegisterCount = maxHeroSMSBatchCount
+	}
+	if config.EmailCount <= 0 {
+		config.EmailCount = 1
+	}
+	if config.EmailCount > userEmailDailyCreateLimit {
+		config.EmailCount = userEmailDailyCreateLimit
+	}
+	config.CustomSub2API.BaseURL = strings.TrimSpace(config.CustomSub2API.BaseURL)
+	config.CustomSub2API.APIKey = strings.TrimSpace(config.CustomSub2API.APIKey)
+	config.CustomSub2API.GroupIDs = positiveGroupIDs(config.CustomSub2API.GroupIDs)
+	config.CustomSub2API.ProxyID = strings.TrimSpace(config.CustomSub2API.ProxyID)
+	return config
+}
+
+func parseConfigGroupIDs(raw string) []int64 {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var ids []int64
+	if err := json.Unmarshal([]byte(raw), &ids); err == nil {
+		return positiveGroupIDs(ids)
+	}
+	var mixed []any
+	if err := json.Unmarshal([]byte(raw), &mixed); err == nil {
+		out := make([]int64, 0, len(mixed))
+		for _, item := range mixed {
+			switch value := item.(type) {
+			case float64:
+				out = append(out, int64(value))
+			case string:
+				if id, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err == nil {
+					out = append(out, id)
+				}
+			}
+		}
+		return positiveGroupIDs(out)
+	}
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == '，' || r == ';' || r == '；' || r == ' ' || r == '\n' || r == '\t'
+	})
+	out := make([]int64, 0, len(parts))
+	for _, part := range parts {
+		if id, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64); err == nil {
+			out = append(out, id)
+		}
+	}
+	return positiveGroupIDs(out)
 }
 
 func (r *Repository) PhoneExists(ctx context.Context, phone string) (bool, error) {

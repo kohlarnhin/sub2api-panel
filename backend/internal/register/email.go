@@ -78,9 +78,20 @@ func (c *EmailClient) ConfiguredForMailbox(mailbox string) bool {
 	return c.Configured() && strings.TrimSpace(mailbox) != ""
 }
 
+func (c *EmailClient) clientForProxy(proxyURL string) (*http.Client, error) {
+	if strings.TrimSpace(proxyURL) == "" {
+		return c.httpClient, nil
+	}
+	return newProxyHTTPClient(proxyURL, emailHTTPTimeout)
+}
+
 // LatestEmailID 返回 OTP 邮箱当前最新邮件 id，作为后续轮询的基线（只取 id 更大的新邮件）。
 func (c *EmailClient) LatestEmailIDForMailbox(ctx context.Context, mailbox string) int {
-	items, err := c.fetchMailItems(ctx, strings.TrimSpace(mailbox))
+	return c.LatestEmailIDForMailboxWithProxy(ctx, mailbox, "")
+}
+
+func (c *EmailClient) LatestEmailIDForMailboxWithProxy(ctx context.Context, mailbox string, proxyURL string) int {
+	items, err := c.fetchMailItems(ctx, strings.TrimSpace(mailbox), proxyURL)
 	if err != nil || len(items) == 0 {
 		return 0
 	}
@@ -91,20 +102,28 @@ func (c *EmailClient) LatestEmailIDForMailbox(ctx context.Context, mailbox strin
 // 当 ctx 有 deadline 时会一直轮询到 ctx 结束；没有 deadline 时才使用 attempts 作为兜底上限。
 // stop 返回 true 时立即中止等待。
 func (c *EmailClient) FetchVerificationCodeForMailbox(ctx context.Context, mailbox string, minID int, stop func() bool, progress func(int, error)) (string, error) {
+	return c.FetchVerificationCodeForMailboxWithProxy(ctx, mailbox, minID, "", stop, progress)
+}
+
+func (c *EmailClient) FetchVerificationCodeForMailboxWithProxy(ctx context.Context, mailbox string, minID int, proxyURL string, stop func() bool, progress func(int, error)) (string, error) {
 	_, hasDeadline := ctx.Deadline()
 	maxAttempts := c.attempts
 	if hasDeadline {
 		maxAttempts = 0
 	}
-	return c.fetchVerificationCode(ctx, strings.TrimSpace(mailbox), minID, maxAttempts, stop, progress)
+	return c.fetchVerificationCode(ctx, strings.TrimSpace(mailbox), minID, maxAttempts, proxyURL, stop, progress)
 }
 
 // FetchVerificationCodeAttempts 轮询固定次数后返回空验证码，供上层触发重新发送 OTP。
 func (c *EmailClient) FetchVerificationCodeAttemptsForMailbox(ctx context.Context, mailbox string, minID, attempts int, stop func() bool, progress func(int, error)) (string, error) {
-	return c.fetchVerificationCode(ctx, strings.TrimSpace(mailbox), minID, attempts, stop, progress)
+	return c.FetchVerificationCodeAttemptsForMailboxWithProxy(ctx, mailbox, minID, attempts, "", stop, progress)
 }
 
-func (c *EmailClient) fetchVerificationCode(ctx context.Context, mailbox string, minID, attempts int, stop func() bool, progress func(int, error)) (string, error) {
+func (c *EmailClient) FetchVerificationCodeAttemptsForMailboxWithProxy(ctx context.Context, mailbox string, minID, attempts int, proxyURL string, stop func() bool, progress func(int, error)) (string, error) {
+	return c.fetchVerificationCode(ctx, strings.TrimSpace(mailbox), minID, attempts, proxyURL, stop, progress)
+}
+
+func (c *EmailClient) fetchVerificationCode(ctx context.Context, mailbox string, minID, attempts int, proxyURL string, stop func() bool, progress func(int, error)) (string, error) {
 	if strings.TrimSpace(mailbox) == "" {
 		return "", fmt.Errorf("OTP 邮箱未配置")
 	}
@@ -118,7 +137,7 @@ func (c *EmailClient) fetchVerificationCode(ctx context.Context, mailbox string,
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		items, err := c.fetchMailItems(ctx, mailbox)
+		items, err := c.fetchMailItems(ctx, mailbox, proxyURL)
 		if err == nil {
 			for _, item := range items {
 				itemID := mailItemID(item)
@@ -128,7 +147,7 @@ func (c *EmailClient) fetchVerificationCode(ctx context.Context, mailbox string,
 				if code := extractEmailCode(item); code != "" {
 					return code, nil
 				}
-				detail, detailErr := c.fetchMailDetail(ctx, mailbox, itemID)
+				detail, detailErr := c.fetchMailDetail(ctx, mailbox, itemID, proxyURL)
 				if detailErr == nil {
 					if code := extractEmailCode(detail); code != "" {
 						return code, nil
@@ -151,7 +170,7 @@ func (c *EmailClient) fetchVerificationCode(ctx context.Context, mailbox string,
 }
 
 // fetchMailItems 拉取 OTP 邮箱邮件列表，按 id 倒序排序。
-func (c *EmailClient) fetchMailItems(ctx context.Context, mailbox string) ([]map[string]any, error) {
+func (c *EmailClient) fetchMailItems(ctx context.Context, mailbox string, proxyURL string) ([]map[string]any, error) {
 	mailbox = strings.TrimSpace(mailbox)
 	if mailbox == "" {
 		return nil, fmt.Errorf("OTP 邮箱未配置")
@@ -163,7 +182,11 @@ func (c *EmailClient) fetchMailItems(ctx context.Context, mailbox string) ([]map
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("accept", "application/json")
-	resp, err := c.httpClient.Do(req)
+	client, err := c.clientForProxy(proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +208,7 @@ func (c *EmailClient) fetchMailItems(ctx context.Context, mailbox string) ([]map
 	return items, nil
 }
 
-func (c *EmailClient) fetchMailDetail(ctx context.Context, mailbox string, id int) (map[string]any, error) {
+func (c *EmailClient) fetchMailDetail(ctx context.Context, mailbox string, id int, proxyURL string) (map[string]any, error) {
 	if id <= 0 {
 		return nil, fmt.Errorf("email id 无效")
 	}
@@ -206,7 +229,7 @@ func (c *EmailClient) fetchMailDetail(ctx context.Context, mailbox string, id in
 	}
 	var lastErr error
 	for _, endpoint := range endpoints {
-		item, err := c.fetchMailDetailEndpoint(ctx, endpoint)
+		item, err := c.fetchMailDetailEndpoint(ctx, endpoint, proxyURL)
 		if err == nil && len(item) > 0 {
 			return item, nil
 		}
@@ -220,14 +243,18 @@ func (c *EmailClient) fetchMailDetail(ctx context.Context, mailbox string, id in
 	return nil, fmt.Errorf("邮件详情为空")
 }
 
-func (c *EmailClient) fetchMailDetailEndpoint(ctx context.Context, endpoint string) (map[string]any, error) {
+func (c *EmailClient) fetchMailDetailEndpoint(ctx context.Context, endpoint string, proxyURL string) (map[string]any, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("accept", "application/json")
-	resp, err := c.httpClient.Do(req)
+	client, err := c.clientForProxy(proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}

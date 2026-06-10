@@ -72,6 +72,7 @@ type sessionState struct {
 	Session
 	apiKey         string
 	sub2api        *CustomSub2APIConfig
+	proxy          proxyConfigSnapshot
 	auth           *AuthSession
 	oauthState     string
 	codeVerifier   string
@@ -95,6 +96,7 @@ type heroSMSCancelTask struct {
 	activationID string
 	phone        string
 	reason       string
+	proxyURL     string
 	createdAt    time.Time
 	cancelAfter  time.Time
 	attempts     int
@@ -115,6 +117,7 @@ type userLoginTask struct {
 
 type userRegisterRunOptions struct {
 	Sub2API *CustomSub2APIConfig
+	Proxy   proxyConfigSnapshot
 }
 
 type userLoginQueue struct {
@@ -181,8 +184,13 @@ func (s *Service) UserDashboard(ctx context.Context, userID int64) (*UserDashboa
 	if err != nil {
 		return nil, err
 	}
+	pageConfig, err := s.repo.GetUserPageConfig(ctx, user.ID)
+	if err != nil {
+		return nil, err
+	}
 	return &UserDashboard{
 		User:           *user,
+		PageConfig:     pageConfig,
 		Summary:        summary,
 		LoginSummary:   loginSummary,
 		Run:            s.publicUserRun(user.ID),
@@ -212,6 +220,23 @@ func (s *Service) UpdateUser(ctx context.Context, req UserUpdateRequest) (*UserD
 	return s.UserDashboard(ctx, user.ID)
 }
 
+func (s *Service) SaveUserPageConfig(ctx context.Context, req UserPageConfigRequest) (*UserDashboard, error) {
+	if req.PageConfig == nil {
+		return nil, fmt.Errorf("页面配置不能为空")
+	}
+	if _, err := s.repo.GetRegisterUserByID(ctx, req.UserID); err != nil {
+		return nil, err
+	}
+	config, err := s.validateAndNormalizePageConfig(*req.PageConfig)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.repo.SaveUserPageConfig(ctx, req.UserID, config); err != nil {
+		return nil, err
+	}
+	return s.UserDashboard(ctx, req.UserID)
+}
+
 func (s *Service) UserEmails(ctx context.Context, userID int64, page, pageSize int, search string) (UserEmailListResponse, error) {
 	if _, err := s.repo.GetRegisterUserByID(ctx, userID); err != nil {
 		return UserEmailListResponse{}, err
@@ -234,9 +259,20 @@ func (s *Service) GenerateUserEmails(ctx context.Context, req UserEmailGenerateR
 	if !user.IsDuck {
 		return nil, fmt.Errorf("当前用户不是 Duck 邮箱用户，请先在 user_email 表中准备未使用邮箱")
 	}
+	pageConfig, err := s.repo.GetUserPageConfig(ctx, user.ID)
+	if err != nil {
+		return nil, err
+	}
 	auth := strings.TrimSpace(req.DuckAuthorization)
 	if auth == "" {
+		auth = strings.TrimSpace(pageConfig.DuckAuthorization)
+	}
+	if auth == "" {
 		return nil, fmt.Errorf("Duck Authorization 不能为空")
+	}
+	emailProxy := strings.TrimSpace(req.Proxy)
+	if emailProxy == "" {
+		emailProxy = pageConfigProxySnapshot(pageConfig).forEmail()
 	}
 	if s.isUserEmailRunActive(user.ID) {
 		return nil, fmt.Errorf("当前用户已有邮箱创建任务")
@@ -273,7 +309,7 @@ func (s *Service) GenerateUserEmails(ctx context.Context, req UserEmailGenerateR
 		result.Attempts++
 		s.updateUserEmailRunProgress(user.ID, result)
 		s.touchUserEmailRun(user.ID, statusRunning, fmt.Sprintf("正在创建 Duck 邮箱 %d/%d（第 %d 次请求）", result.Created+1, count, result.Attempts), "", "", "")
-		email, raw, err := s.duck.CreateEmail(ctx, auth, req.Proxy)
+		email, raw, err := s.duck.CreateEmail(ctx, auth, emailProxy)
 		if err != nil {
 			result.Errors = append(result.Errors, err.Error())
 			result.Failed++
@@ -326,7 +362,15 @@ func (s *Service) UploadUserAccountSub2API(ctx context.Context, req UserSub2APIU
 	if len(payload) == 0 {
 		return nil, fmt.Errorf("当前账号还没有可上传的 Sub2API JSON")
 	}
-	options, err := validateUserRegisterRunOptions(req.CustomSub2API)
+	pageConfig, err := s.resolvePageConfig(ctx, user.ID, req.PageConfig)
+	if err != nil {
+		return nil, err
+	}
+	customSub2API := req.CustomSub2API
+	if customSub2API == nil {
+		customSub2API = &pageConfig.CustomSub2API
+	}
+	options, err := validateUserRegisterRunOptions(customSub2API, pageConfigProxySnapshot(pageConfig))
 	if err != nil {
 		return nil, err
 	}
@@ -335,7 +379,7 @@ func (s *Service) UploadUserAccountSub2API(ctx context.Context, req UserSub2APIU
 	proxyID := ""
 	uploadTarget := "用户 Sub2API 分组"
 	if options.Sub2API != nil && options.Sub2API.Enabled {
-		client = NewSub2APIClient(options.Sub2API.BaseURL, options.Sub2API.APIKey)
+		client = NewSub2APIClient(options.Sub2API.BaseURL, options.Sub2API.APIKey).WithProxy(options.Proxy.forSub2API())
 		groupIDs = normalizeGroupIDs(options.Sub2API.GroupIDs)
 		proxyID = options.Sub2API.ProxyID
 		uploadTarget = "自定义 Sub2API 分组"
@@ -393,7 +437,15 @@ func (s *Service) StartUserRegister(ctx context.Context, req UserRegisterStartRe
 	if summary.EmailUnused < count {
 		return nil, fmt.Errorf("当前用户未使用邮箱不足：需要 %d 个，当前 %d 个", count, summary.EmailUnused)
 	}
-	options, err := validateUserRegisterRunOptions(req.CustomSub2API)
+	pageConfig, err := s.resolvePageConfig(ctx, user.ID, req.PageConfig)
+	if err != nil {
+		return nil, err
+	}
+	customSub2API := req.CustomSub2API
+	if customSub2API == nil {
+		customSub2API = &pageConfig.CustomSub2API
+	}
+	options, err := validateUserRegisterRunOptions(customSub2API, pageConfigProxySnapshot(pageConfig))
 	if err != nil {
 		return nil, err
 	}
@@ -463,7 +515,7 @@ func (s *Service) StartHeroSMS(ctx context.Context, req StartRequest) (*Session,
 	if apiKey == "" {
 		return nil, fmt.Errorf("HeroSMS API Key 不能为空")
 	}
-	session := s.newSession(apiKey, normalizeGroupIDs(req.GroupIDs), "正在准备 HeroSMS 自动注册")
+	session := s.newSession(apiKey, normalizeGroupIDs(req.GroupIDs), "正在准备 HeroSMS 自动注册", proxyConfigSnapshot{})
 	runCtx, cancel := context.WithCancel(context.Background())
 	session.workerCancel = cancel
 	go s.runHeroSMSAutoRegister(runCtx, session.ID)
@@ -538,11 +590,12 @@ func (s *Service) Stop(id string) (*Session, error) {
 	apiKey := session.apiKey
 	activationID := session.HeroSMSActivationID
 	phone := session.Phone
+	smsProxy := session.proxy.forSMS()
 	snapshot := cloneSession(&session.Session)
 	s.mu.Unlock()
 
 	if activationID != "" && apiKey != "" {
-		s.queueHeroSMSCancel(apiKey, activationID, phone, "manual_stop", heroSMSCancelDelay)
+		s.queueHeroSMSCancel(apiKey, activationID, phone, "manual_stop", heroSMSCancelDelay, smsProxy)
 	}
 	return snapshot, nil
 }
@@ -633,11 +686,12 @@ func (s *Service) sendEmailCode(ctx context.Context, sessionID string) error {
 		_ = s.authGetDiscardForSession(ctx, session, emailPageURL)
 	}
 	autoFetch := s.email.ConfiguredForMailbox(otpMailbox)
+	emailProxy := session.proxy.forEmail()
 
 	for round := 1; ; round++ {
 		baselineID := 0
 		if autoFetch {
-			baselineID = s.email.LatestEmailIDForMailbox(ctx, otpMailbox)
+			baselineID = s.email.LatestEmailIDForMailboxWithProxy(ctx, otpMailbox, emailProxy)
 		}
 		sendStep := "正在发送邮箱验证码"
 		if round > 1 {
@@ -678,7 +732,7 @@ func (s *Service) sendEmailCode(ctx context.Context, sessionID string) error {
 		}
 		s.touch(sessionID, statusRunning, codeStep, "", sendData)
 		s.logUserRunForSession(sessionID, "info", codeStep)
-		code, err := s.email.FetchVerificationCodeAttemptsForMailbox(ctx, otpMailbox, baselineID, emailOTPResendFetchAttempts, func() bool {
+		code, err := s.email.FetchVerificationCodeAttemptsForMailboxWithProxy(ctx, otpMailbox, baselineID, emailOTPResendFetchAttempts, emailProxy, func() bool {
 			return s.isSessionStopped(sessionID)
 		}, func(attempt int, fetchErr error) {
 			step := fmt.Sprintf("邮箱验证码已发送，正在自动获取验证码（第 %d/%d 次）", attempt, emailOTPResendFetchAttempts)
@@ -734,9 +788,10 @@ func (s *Service) sendLoginEmailOTP(ctx context.Context, sessionID string, authD
 	otpMailbox := s.sessionOTPMailbox(session)
 	emailPageURL := firstString(continueURL(authData), "https://auth.openai.com/email-verification")
 	autoFetch := s.email.ConfiguredForMailbox(otpMailbox)
+	emailProxy := session.proxy.forEmail()
 	baselineID := 0
 	if autoFetch {
-		baselineID = s.email.LatestEmailIDForMailbox(ctx, otpMailbox)
+		baselineID = s.email.LatestEmailIDForMailboxWithProxy(ctx, otpMailbox, emailProxy)
 	}
 	s.touch(sessionID, statusRunning, "正在发送登录邮箱验证码", "", nil)
 	sendURL := firstString(continueURL(authData), "https://auth.openai.com/api/accounts/email-otp/send")
@@ -776,7 +831,7 @@ func (s *Service) waitLoginEmailOTP(ctx context.Context, sessionID string, authD
 		return nil
 	}
 	s.touch(sessionID, statusRunning, "登录邮箱验证码已发送，正在自动获取验证码", "", authData)
-	code, err := s.email.FetchVerificationCodeAttemptsForMailbox(ctx, otpMailbox, baselineID, emailOTPResendFetchAttempts, func() bool {
+	code, err := s.email.FetchVerificationCodeAttemptsForMailboxWithProxy(ctx, otpMailbox, baselineID, emailOTPResendFetchAttempts, session.proxy.forEmail(), func() bool {
 		return s.isSessionStopped(sessionID)
 	}, func(attempt int, fetchErr error) {
 		step := fmt.Sprintf("登录邮箱验证码已发送，正在自动获取验证码（第 %d/%d 次）", attempt, emailOTPResendFetchAttempts)
@@ -803,7 +858,7 @@ func (s *Service) waitLoginEmailOTP(ctx context.Context, sessionID string, authD
 	return nil
 }
 
-func (s *Service) newSession(apiKey string, groupIDs []int64, step string) *sessionState {
+func (s *Service) newSession(apiKey string, groupIDs []int64, step string, proxy proxyConfigSnapshot) *sessionState {
 	name, birthdate := randomProfile()
 	now := time.Now()
 	state := &sessionState{
@@ -821,6 +876,7 @@ func (s *Service) newSession(apiKey string, groupIDs []int64, step string) *sess
 			HeroSMSAttempts: []HeroSMSAttempt{},
 		},
 		apiKey: strings.TrimSpace(apiKey),
+		proxy:  proxy,
 	}
 	s.mu.Lock()
 	s.sessions[state.ID] = state
@@ -829,7 +885,7 @@ func (s *Service) newSession(apiKey string, groupIDs []int64, step string) *sess
 }
 
 func (s *Service) newUserSession(apiKey string, user RegisterUser, runID, step string, options userRegisterRunOptions) *sessionState {
-	state := s.newSession(apiKey, []int64{user.GroupID}, step)
+	state := s.newSession(apiKey, []int64{user.GroupID}, step, options.Proxy)
 	s.mu.Lock()
 	if current := s.sessions[state.ID]; current != nil {
 		current.UserID = user.ID
@@ -875,7 +931,7 @@ func (s *Service) runBatch(ctx context.Context, batchID string) {
 		s.mu.RUnlock()
 
 		currentIndex := success + 1
-		session := s.newSession(payload.APIKey, payload.GroupIDs, fmt.Sprintf("批量注册 %d/%d：正在准备 HeroSMS 自动注册", currentIndex, target))
+		session := s.newSession(payload.APIKey, payload.GroupIDs, fmt.Sprintf("批量注册 %d/%d：正在准备 HeroSMS 自动注册", currentIndex, target), proxyConfigSnapshot{})
 		s.mu.Lock()
 		if b := s.batches[batchID]; b != nil {
 			b.CurrentSessionID = session.ID
@@ -1168,7 +1224,7 @@ func (s *Service) runHeroSMSAutoRegister(ctx context.Context, sessionID string) 
 			step := fmt.Sprintf("正在用 HeroSMS 模板 %s 获取手机号（第 %d 次）", template.Name, attempt)
 			s.touch(sessionID, statusRunning, step, "", nil)
 			s.logUserRunForSession(sessionID, "info", step)
-			numberData, err := s.heroSMS.GetNumber(tryCtx, apiKey, template)
+			numberData, err := s.heroSMS.GetNumber(tryCtx, apiKey, template, session.proxy.forSMS())
 			if err != nil {
 				return err
 			}
@@ -1183,7 +1239,7 @@ func (s *Service) runHeroSMSAutoRegister(ctx context.Context, sessionID string) 
 				s.logger.Warn("phone exists check failed", zap.Error(err))
 			}
 			if exists {
-				cancelData := s.queueHeroSMSCancel(apiKey, activationID, phone, "phone_exists", heroSMSCancelDelay)
+				cancelData := s.queueHeroSMSCancel(apiKey, activationID, phone, "phone_exists", heroSMSCancelDelay, session.proxy.forSMS())
 				step := fmt.Sprintf("手机号 %s 已存在，已加入取消队列，继续重新获取手机号", phone)
 				s.touch(sessionID, statusRunning, step, "", map[string]any{"number": numberData, "cancel_queue": cancelData})
 				s.logUserRunForSession(sessionID, "warn", step)
@@ -1218,7 +1274,7 @@ func (s *Service) runHeroSMSAutoRegister(ctx context.Context, sessionID string) 
 				return err
 			}
 			if code == "" {
-				cancelData := s.queueHeroSMSCancel(apiKey, activationID, phone, "sms_timeout", 0)
+				cancelData := s.queueHeroSMSCancel(apiKey, activationID, phone, "sms_timeout", 0, session.proxy.forSMS())
 				if s.isSessionStopped(sessionID) {
 					s.touch(sessionID, statusStopped, "已停止获取手机号，当前激活已加入取消队列", "", map[string]any{"activation_id": activationID, "phone": phone, "cancel_queue": cancelData})
 					s.logUserRunForSession(sessionID, "warn", fmt.Sprintf("已停止，手机号 %s 当前激活已加入取消队列", phone))
@@ -1238,7 +1294,7 @@ func (s *Service) runHeroSMSAutoRegister(ctx context.Context, sessionID string) 
 			if err := s.verifyPhoneCode(tryCtx, sessionID, code); err != nil {
 				return err
 			}
-			s.completeHeroSMS(apiKey, activationID)
+			s.completeHeroSMS(apiKey, activationID, session.proxy.forSMS())
 			activationFinished = true
 			return nil
 		}()
@@ -1254,7 +1310,7 @@ func (s *Service) runHeroSMSAutoRegister(ctx context.Context, sessionID string) 
 		s.logger.Warn("HeroSMS phone register attempt failed", zap.Int("attempt", attempt), zap.Error(err))
 		if activationID != "" && !activationFinished {
 			reason := truncate(err.Error(), 120)
-			cancelData := s.queueHeroSMSCancel(apiKey, activationID, phone, reason, heroSMSCancelDelay)
+			cancelData := s.queueHeroSMSCancel(apiKey, activationID, phone, reason, heroSMSCancelDelay, session.proxy.forSMS())
 			s.touch(sessionID, statusRunning, fmt.Sprintf("手机号 %s 不可用于新注册，已加入取消队列", phone), "", map[string]any{
 				"activation_id": activationID,
 				"phone":         phone,
@@ -1299,7 +1355,7 @@ func (s *Service) beginPhoneRegister(ctx context.Context, sessionID string) erro
 	if phone == "" {
 		return fmt.Errorf("手机号不能为空")
 	}
-	auth, err := newAuthSession()
+	auth, err := newAuthSessionWithProxy(session.proxy.forOpenAI())
 	if err != nil {
 		return err
 	}
@@ -1340,7 +1396,7 @@ func (s *Service) beginPhoneRegister(ctx context.Context, sessionID string) erro
 	}
 
 	cookieHeader := authCookieHeader(auth.Jar)
-	sentinelHeaders, err := mintSentinelHeaders(ctx, s.sentinelScript, did, "authorize_continue", cookieHeader, "https://auth.openai.com/create-account")
+	sentinelHeaders, err := mintSentinelHeaders(ctx, s.sentinelScript, did, "authorize_continue", cookieHeader, "https://auth.openai.com/create-account", session.proxy.forOpenAI())
 	if err != nil {
 		return err
 	}
@@ -1376,7 +1432,7 @@ func (s *Service) beginPhoneRegister(ctx context.Context, sessionID string) erro
 	}
 
 	cookieHeader = authCookieHeader(auth.Jar)
-	sentinelHeaders, err = mintSentinelHeaders(ctx, s.sentinelScript, did, "authorize_continue", cookieHeader, passwordPageURL)
+	sentinelHeaders, err = mintSentinelHeaders(ctx, s.sentinelScript, did, "authorize_continue", cookieHeader, passwordPageURL, session.proxy.forOpenAI())
 	if err != nil {
 		return err
 	}
@@ -1522,6 +1578,7 @@ func (s *Service) createAccountProfile(ctx context.Context, sessionID string, ph
 			createAccountFlow,
 			authCookieHeader(session.auth.Jar),
 			"https://auth.openai.com/about-you",
+			session.proxy.forOpenAI(),
 		)
 		if err == nil {
 			copyHeaders(headers, sentinelHeaders)
@@ -1546,7 +1603,7 @@ func (s *Service) startCodexLogin(ctx context.Context, sessionID string) error {
 	if session == nil {
 		return fmt.Errorf("手机号注册会话不存在: %s", sessionID)
 	}
-	auth, err := newAuthSession()
+	auth, err := newAuthSessionWithProxy(session.proxy.forOpenAI())
 	if err != nil {
 		return err
 	}
@@ -1588,7 +1645,7 @@ func (s *Service) startCodexLogin(ctx context.Context, sessionID string) error {
 	}
 
 	s.touch(sessionID, statusRunning, "正在提交手机号登录", "", nil)
-	sentinelHeaders, err := mintSentinelHeaders(ctx, s.sentinelScript, did, "authorize_continue", authCookieHeaderForURL(auth.Jar, "https://auth.openai.com/log-in"), "https://auth.openai.com/log-in")
+	sentinelHeaders, err := mintSentinelHeaders(ctx, s.sentinelScript, did, "authorize_continue", authCookieHeaderForURL(auth.Jar, "https://auth.openai.com/log-in"), "https://auth.openai.com/log-in", session.proxy.forOpenAI())
 	if err != nil {
 		s.touch(sessionID, statusFailed, "Codex 登录失败", err.Error(), nil)
 		return err
@@ -1618,7 +1675,7 @@ func (s *Service) startCodexLogin(ctx context.Context, sessionID string) error {
 		_ = s.authGetDiscardForSession(ctx, session, loginContinueURL)
 	}
 	s.touch(sessionID, statusRunning, "正在验证 Codex 登录密码", "", nil)
-	sentinelHeaders, err = mintSentinelHeaders(ctx, s.sentinelScript, did, "authorize_continue", authCookieHeaderForURL(auth.Jar, passwordPageURL), passwordPageURL)
+	sentinelHeaders, err = mintSentinelHeaders(ctx, s.sentinelScript, did, "authorize_continue", authCookieHeaderForURL(auth.Jar, passwordPageURL), passwordPageURL, session.proxy.forOpenAI())
 	if err != nil {
 		s.touch(sessionID, statusFailed, "Codex 登录失败", err.Error(), nil)
 		return err
@@ -1753,8 +1810,8 @@ func (s *Service) finishOrWaitCodex(ctx context.Context, sessionID string, authD
 	return nil
 }
 
-func validateUserRegisterRunOptions(custom *CustomSub2APIConfig) (userRegisterRunOptions, error) {
-	options := userRegisterRunOptions{}
+func validateUserRegisterRunOptions(custom *CustomSub2APIConfig, proxy proxyConfigSnapshot) (userRegisterRunOptions, error) {
+	options := userRegisterRunOptions{Proxy: proxy}
 	if custom == nil || !custom.Enabled {
 		return options, nil
 	}
@@ -1790,6 +1847,41 @@ func validateUserRegisterRunOptions(custom *CustomSub2APIConfig) (userRegisterRu
 	return options, nil
 }
 
+func (s *Service) resolvePageConfig(ctx context.Context, userID int64, override *UserPageConfig) (UserPageConfig, error) {
+	if override != nil {
+		return s.validateAndNormalizePageConfig(*override)
+	}
+	config, err := s.repo.GetUserPageConfig(ctx, userID)
+	if err != nil {
+		return UserPageConfig{}, err
+	}
+	return s.validateAndNormalizePageConfig(config)
+}
+
+func (s *Service) validateAndNormalizePageConfig(config UserPageConfig) (UserPageConfig, error) {
+	config = normalizeUserPageConfig(config)
+	if err := validateProxyURL(config.GlobalProxy); err != nil {
+		return config, err
+	}
+	if config.CustomSub2API.ProxyID != "" {
+		id, err := strconv.ParseInt(config.CustomSub2API.ProxyID, 10, 64)
+		if err != nil || id <= 0 {
+			return config, fmt.Errorf("自定义 Sub2API 代理 ID 必须是正整数")
+		}
+	}
+	return config, nil
+}
+
+func pageConfigProxySnapshot(config UserPageConfig) proxyConfigSnapshot {
+	return proxyConfigSnapshot{
+		ProxyURL:     strings.TrimSpace(config.GlobalProxy),
+		SMSProxy:     config.ProxySMSEnabled,
+		OpenAIProxy:  config.ProxyOpenAIEnabled,
+		EmailProxy:   config.ProxyEmailEnabled,
+		Sub2APIProxy: config.ProxySub2APIEnabled,
+	}
+}
+
 func cloneCustomSub2APIConfig(in *CustomSub2APIConfig) *CustomSub2APIConfig {
 	if in == nil {
 		return nil
@@ -1805,7 +1897,10 @@ func cloneCustomSub2APIConfig(in *CustomSub2APIConfig) *CustomSub2APIConfig {
 
 func (s *Service) sub2apiClientForSession(session *sessionState) *Sub2APIClient {
 	if session != nil && session.sub2api != nil && session.sub2api.Enabled {
-		return NewSub2APIClient(session.sub2api.BaseURL, session.sub2api.APIKey)
+		return NewSub2APIClient(session.sub2api.BaseURL, session.sub2api.APIKey).WithProxy(session.proxy.forSub2API())
+	}
+	if session != nil {
+		return s.sub2api.WithProxy(session.proxy.forSub2API())
 	}
 	return s.sub2api
 }
@@ -2040,7 +2135,7 @@ func (s *Service) exchangeCallbackForToken(ctx context.Context, sessionID, callb
 	if state != session.oauthState {
 		return nil, fmt.Errorf("OAuth state 不匹配")
 	}
-	tokenResp, err := exchangeToken(ctx, code, session.codeVerifier)
+	tokenResp, err := exchangeTokenWithProxy(ctx, code, session.codeVerifier, session.proxy.forOpenAI())
 	if err != nil {
 		return nil, err
 	}
@@ -2068,6 +2163,11 @@ func (s *Service) waitHeroSMSCode(ctx context.Context, sessionID string, apiKey 
 	pollIndex := 0
 	resendCount := 0
 	var lastStatus map[string]any
+	session := s.getState(sessionID)
+	smsProxy := ""
+	if session != nil {
+		smsProxy = session.proxy.forSMS()
+	}
 	for pollIndex < heroSMSStatusMaxAttempts {
 		if s.sleepWithStop(ctx, sessionID, heroSMSStatusPollInterval) {
 			s.touch(sessionID, statusRunning, "已请求停止等待 HeroSMS 短信验证码", "", nil)
@@ -2080,7 +2180,7 @@ func (s *Service) waitHeroSMSCode(ctx context.Context, sessionID string, apiKey 
 		}
 		s.updatePhoneCodeProgress(sessionID, pollIndex, heroSMSStatusMaxAttempts)
 		s.touch(sessionID, statusRunning, fmt.Sprintf("等待 HeroSMS 短信验证码（第 %d 次，剩余 %d 秒）", pollIndex, remaining), "", nil)
-		statusData, err := s.heroSMS.GetStatus(ctx, apiKey, activationID)
+		statusData, err := s.heroSMS.GetStatus(ctx, apiKey, activationID, smsProxy)
 		if err != nil {
 			return "", err
 		}
@@ -2793,10 +2893,10 @@ func (s *Service) closeAuthSession(sessionID string) {
 	}
 }
 
-func (s *Service) cancelHeroSMS(apiKey, activationID string) map[string]any {
+func (s *Service) cancelHeroSMS(apiKey, activationID, proxyURL string) map[string]any {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	data, err := s.heroSMS.SetStatus(ctx, apiKey, activationID, 8)
+	data, err := s.heroSMS.SetStatus(ctx, apiKey, activationID, 8, proxyURL)
 	if err != nil {
 		statusCode := 0
 		if heroErr, ok := err.(*HeroSMSError); ok {
@@ -2814,11 +2914,11 @@ func (s *Service) cancelHeroSMS(apiKey, activationID string) map[string]any {
 	return data
 }
 
-func (s *Service) completeHeroSMS(apiKey, activationID string) {
+func (s *Service) completeHeroSMS(apiKey, activationID, proxyURL string) {
 	s.removeHeroSMSCancel(apiKey, activationID)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if _, err := s.heroSMS.SetStatus(ctx, apiKey, activationID, 6); err != nil {
+	if _, err := s.heroSMS.SetStatus(ctx, apiKey, activationID, 6, proxyURL); err != nil {
 		s.logger.Warn("HeroSMS complete status failed", zap.String("activation_id", activationID), zap.Error(err))
 	}
 }
@@ -2847,11 +2947,12 @@ func isRetryablePhoneAttemptError(err error) bool {
 	return false
 }
 
-func (s *Service) queueHeroSMSCancel(apiKey, activationID, phone, reason string, delay time.Duration) map[string]any {
+func (s *Service) queueHeroSMSCancel(apiKey, activationID, phone, reason string, delay time.Duration, proxyURL string) map[string]any {
 	apiKey = strings.TrimSpace(apiKey)
 	activationID = strings.TrimSpace(activationID)
 	phone = strings.TrimSpace(phone)
 	reason = strings.TrimSpace(reason)
+	proxyURL = strings.TrimSpace(proxyURL)
 	if apiKey == "" || activationID == "" {
 		return map[string]any{
 			"queued":            false,
@@ -2877,6 +2978,7 @@ func (s *Service) queueHeroSMSCancel(apiKey, activationID, phone, reason string,
 		if reason != "" {
 			existing.reason = reason
 		}
+		existing.proxyURL = proxyURL
 		if existing.cancelAfter.Before(cancelAfter) {
 			existing.cancelAfter = cancelAfter
 		}
@@ -2887,6 +2989,7 @@ func (s *Service) queueHeroSMSCancel(apiKey, activationID, phone, reason string,
 			activationID: activationID,
 			phone:        phone,
 			reason:       reason,
+			proxyURL:     proxyURL,
 			createdAt:    createdAt,
 			cancelAfter:  cancelAfter,
 		}
@@ -2948,7 +3051,7 @@ func (s *Service) runHeroSMSCancelWorker() {
 		if !ok {
 			continue
 		}
-		result := s.cancelHeroSMS(task.apiKey, task.activationID)
+		result := s.cancelHeroSMS(task.apiKey, task.activationID, task.proxyURL)
 		if errText := strings.TrimSpace(stringValue(result["error"])); errText != "" {
 			statusCode := int(int64Value(result["status_code"]))
 			retryable := boolValue(result["retryable"])
