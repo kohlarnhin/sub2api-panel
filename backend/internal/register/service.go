@@ -30,6 +30,7 @@ const (
 	defaultHeroSMSFastHandoffSeconds = 60
 	minHeroSMSFastHandoffSeconds     = 10
 	maxHeroSMSFastHandoffSeconds     = 180
+	heroSMSPhoneSMSSendMaxRetries    = 3
 	heroSMSPhoneOTPMaxResends        = 2
 	heroSMSStatusMaxAttempts         = int(heroSMSStatusTimeout / heroSMSStatusPollInterval)
 	heroSMSNumberRetryInterval       = 10 * time.Second
@@ -70,15 +71,16 @@ type Service struct {
 
 type sessionState struct {
 	Session
-	apiKey             string
-	sub2api            *CustomSub2APIConfig
-	proxy              proxyConfigSnapshot
-	fastHandoffTimeout time.Duration
-	auth               *AuthSession
-	oauthState         string
-	codeVerifier       string
-	emailVerifyURL     string
-	emailContinue      string
+	apiKey              string
+	sub2api             *CustomSub2APIConfig
+	proxy               proxyConfigSnapshot
+	fastHandoffTimeout  time.Duration
+	phoneOTPResendCount int
+	auth                *AuthSession
+	oauthState          string
+	codeVerifier        string
+	emailVerifyURL      string
+	emailContinue       string
 	// userEmailBindActive 标记本会话正处于「绑定已分配 user_email」的 add-email 流程，
 	// 用于区别登录邮箱 OTP（两者共用 verifyEmailCodeWithSession）：仅前者在验证码确认
 	// 成功后需要立即把 user_email 标记为已用。
@@ -1775,6 +1777,7 @@ func (s *Service) runHeroSMSAutoRegister(ctx context.Context, sessionID string) 
 					current.Phone = phone
 					current.HeroSMSActivationID = activationID
 					current.HeroSMSAttempt = attempt
+					current.phoneOTPResendCount = 0
 					current.HeroSMSAttempts = append(current.HeroSMSAttempts, HeroSMSAttempt{
 						Attempt:      attempt,
 						ActivationID: activationID,
@@ -2118,8 +2121,9 @@ func (s *Service) beginPhoneRegister(ctx context.Context, sessionID string) erro
 
 func (s *Service) beginPhoneRegisterUntilCancel(ctx context.Context, sessionID, phone string, cancelAt time.Time) error {
 	attempt := 0
+	maxAttempts := heroSMSPhoneSMSSendMaxRetries + 1
 	var lastErr error
-	for {
+	for attempt < maxAttempts {
 		if s.isSessionStopped(sessionID) || ctx.Err() != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -2144,6 +2148,17 @@ func (s *Service) beginPhoneRegisterUntilCancel(ctx context.Context, sessionID, 
 		if !isRetryableBeginPhoneRegisterError(err) {
 			return err
 		}
+		if attempt >= maxAttempts {
+			step = fmt.Sprintf("手机号 %s 注册短信发送失败，已达到最大重试次数（%d 次）", phone, heroSMSPhoneSMSSendMaxRetries)
+			s.touch(sessionID, statusRunning, step, err.Error(), map[string]any{
+				"phone":        phone,
+				"attempt":      attempt,
+				"max_retries":  heroSMSPhoneSMSSendMaxRetries,
+				"max_attempts": maxAttempts,
+			})
+			s.logUserRunForSession(sessionID, "warn", step+"："+err.Error())
+			return err
+		}
 		wait := time.Until(cancelAt)
 		if cancelAt.IsZero() || wait > heroSMSStatusPollInterval {
 			wait = heroSMSStatusPollInterval
@@ -2151,10 +2166,12 @@ func (s *Service) beginPhoneRegisterUntilCancel(ctx context.Context, sessionID, 
 		if wait <= 0 {
 			return err
 		}
-		step = fmt.Sprintf("手机号 %s 注册短信发送失败，取消时间前继续重试（第 %d 次）", phone, attempt)
+		step = fmt.Sprintf("手机号 %s 注册短信发送失败，取消时间前继续重试（第 %d/%d 次）", phone, attempt, heroSMSPhoneSMSSendMaxRetries)
 		s.touch(sessionID, statusRunning, step, err.Error(), map[string]any{
 			"phone":         phone,
 			"attempt":       attempt,
+			"max_retries":   heroSMSPhoneSMSSendMaxRetries,
+			"max_attempts":  maxAttempts,
 			"retry_seconds": int(wait.Seconds()),
 		})
 		s.logUserRunForSession(sessionID, "warn", step+"："+err.Error())
@@ -2972,7 +2989,6 @@ func (s *Service) waitHeroSMSCodeWithTimeout(ctx context.Context, sessionID stri
 	maxAttempts := int((timeout + heroSMSStatusPollInterval - time.Nanosecond) / heroSMSStatusPollInterval)
 	deadline := time.Now().Add(timeout)
 	pollIndex := 0
-	resendCount := 0
 	var lastStatus map[string]any
 	var lastErr error
 	session := s.getState(sessionID)
@@ -3020,9 +3036,12 @@ func (s *Service) waitHeroSMSCodeWithTimeout(ctx context.Context, sessionID stri
 			s.updatePhoneCodeProgress(sessionID, 0, 0)
 			return code, nil
 		}
-		if shouldResendPhoneOTP(pollIndex) && resendCount < heroSMSPhoneOTPMaxResends {
-			resendCount++
-			step := fmt.Sprintf("第 %d 次获取手机号验证码仍未收到，正在第 %d 次重新发送验证码", pollIndex, resendCount)
+		if shouldResendPhoneOTP(pollIndex) {
+			resendCount := s.nextPhoneOTPResendCount(sessionID)
+			if resendCount <= 0 {
+				continue
+			}
+			step := fmt.Sprintf("第 %d 次获取手机号验证码仍未收到，正在第 %d/%d 次重新发送验证码", pollIndex, resendCount, heroSMSPhoneOTPMaxResends)
 			s.touch(sessionID, statusRunning, step, "", statusData)
 			s.logUserRunForSession(sessionID, "warn", step)
 			resendData, resendErr := s.resendPhoneOTP(ctx, sessionID)
@@ -3049,6 +3068,18 @@ func (s *Service) waitHeroSMSCodeWithTimeout(ctx context.Context, sessionID stri
 
 func shouldResendPhoneOTP(pollIndex int) bool {
 	return pollIndex == 6 || pollIndex == 9
+}
+
+func (s *Service) nextPhoneOTPResendCount(sessionID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	session := s.sessions[sessionID]
+	if session == nil || session.phoneOTPResendCount >= heroSMSPhoneOTPMaxResends {
+		return 0
+	}
+	session.phoneOTPResendCount++
+	session.UpdatedAt = time.Now()
+	return session.phoneOTPResendCount
 }
 
 func (s *Service) resendPhoneOTP(ctx context.Context, sessionID string) (map[string]any, error) {
