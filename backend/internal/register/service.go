@@ -2182,6 +2182,10 @@ func (s *Service) beginPhoneRegisterUntilCancel(ctx context.Context, sessionID, 
 			return context.Canceled
 		}
 	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return fmt.Errorf("手机号注册短信发送在最大重试次数内未完成")
 }
 
 func isRetryableBeginPhoneRegisterError(err error) bool {
