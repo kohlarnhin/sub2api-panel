@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,27 +22,30 @@ import (
 )
 
 const (
-	emailOTPUnavailableMessage  = "邮箱验证码无法自动获取，请检查当前用户接收验证码邮箱和 freemail 配置"
-	emailOTPResendFetchAttempts = 10
-	userEmailDailyCreateLimit   = 50
-	heroSMSStatusPollInterval   = 10 * time.Second
-	heroSMSStatusTimeout        = 150 * time.Second
-	heroSMSPhoneOTPMaxResends   = 2
-	heroSMSStatusMaxAttempts    = int(heroSMSStatusTimeout / heroSMSStatusPollInterval)
-	heroSMSNumberRetryInterval  = 10 * time.Second
-	heroSMSCancelDelay          = 180 * time.Second
-	heroSMSCancelRetryInterval  = 15 * time.Second
-	heroSMSCancelMaxRetries     = 3
-	maxHeroSMSBatchCount        = 100
-	statusCreated               = "created"
-	statusRunning               = "running"
-	statusPhoneCodeSent         = "phone_code_sent"
-	statusCodexEmailRequired    = "codex_email_required"
-	statusEmailCodeSent         = "email_code_sent"
-	statusSuccess               = "success"
-	statusFailed                = "failed"
-	statusStopped               = "stopped"
-	statusRegistrationBlocked   = "registration_blocked"
+	emailOTPUnavailableMessage       = "邮箱验证码无法自动获取，请检查当前用户接收验证码邮箱和 freemail 配置"
+	emailOTPResendFetchAttempts      = 10
+	userEmailDailyCreateLimit        = 50
+	heroSMSStatusPollInterval        = 10 * time.Second
+	heroSMSStatusTimeout             = 150 * time.Second
+	defaultHeroSMSFastHandoffSeconds = 60
+	minHeroSMSFastHandoffSeconds     = 10
+	maxHeroSMSFastHandoffSeconds     = 180
+	heroSMSPhoneOTPMaxResends        = 2
+	heroSMSStatusMaxAttempts         = int(heroSMSStatusTimeout / heroSMSStatusPollInterval)
+	heroSMSNumberRetryInterval       = 10 * time.Second
+	heroSMSTemplateTryInterval       = 2 * time.Second
+	heroSMSCancelDelay               = 180 * time.Second
+	maxHeroSMSBatchCount             = 100
+	statusCreated                    = "created"
+	statusRunning                    = "running"
+	statusWaitingPhoneCode           = "waiting_phone_code"
+	statusPhoneCodeSent              = "phone_code_sent"
+	statusCodexEmailRequired         = "codex_email_required"
+	statusEmailCodeSent              = "email_code_sent"
+	statusSuccess                    = "success"
+	statusFailed                     = "failed"
+	statusStopped                    = "stopped"
+	statusRegistrationBlocked        = "registration_blocked"
 )
 
 type Service struct {
@@ -56,11 +60,7 @@ type Service struct {
 	mu       sync.RWMutex
 	sessions map[string]*sessionState
 	batches  map[string]*batchState
-
-	cancelMu     sync.Mutex
-	cancelTasks  map[string]*heroSMSCancelTask
-	cancelNotify chan struct{}
-	cancelOnce   sync.Once
+	cancels  map[string]*PhoneCancelQueueItem
 
 	userMu      sync.RWMutex
 	userRuns    map[int64]*userRunState
@@ -70,19 +70,21 @@ type Service struct {
 
 type sessionState struct {
 	Session
-	apiKey         string
-	sub2api        *CustomSub2APIConfig
-	proxy          proxyConfigSnapshot
-	auth           *AuthSession
-	oauthState     string
-	codeVerifier   string
-	emailVerifyURL string
-	emailContinue  string
+	apiKey             string
+	sub2api            *CustomSub2APIConfig
+	proxy              proxyConfigSnapshot
+	fastHandoffTimeout time.Duration
+	auth               *AuthSession
+	oauthState         string
+	codeVerifier       string
+	emailVerifyURL     string
+	emailContinue      string
 	// userEmailBindActive 标记本会话正处于「绑定已分配 user_email」的 add-email 流程，
 	// 用于区别登录邮箱 OTP（两者共用 verifyEmailCodeWithSession）：仅前者在验证码确认
 	// 成功后需要立即把 user_email 标记为已用。
 	userEmailBindActive bool
 	workerCancel        context.CancelFunc
+	logs                []UserRunLog
 }
 
 type batchState struct {
@@ -90,22 +92,12 @@ type batchState struct {
 	payload StartRequest
 }
 
-type heroSMSCancelTask struct {
-	key          string
-	apiKey       string
-	activationID string
-	phone        string
-	reason       string
-	proxyURL     string
-	createdAt    time.Time
-	cancelAfter  time.Time
-	attempts     int
-	lastError    string
-}
-
 type userRunState struct {
 	UserRun
-	cancel context.CancelFunc
+	cancel           context.CancelFunc
+	waitingSessions  map[string]struct{}
+	settledSessions  map[string]struct{}
+	completedTargets map[string]struct{}
 }
 
 type userLoginTask struct {
@@ -116,8 +108,10 @@ type userLoginTask struct {
 }
 
 type userRegisterRunOptions struct {
-	Sub2API *CustomSub2APIConfig
-	Proxy   proxyConfigSnapshot
+	Sub2API            *CustomSub2APIConfig
+	Proxy              proxyConfigSnapshot
+	Templates          []HeroSMSTemplate
+	FastHandoffSeconds int
 }
 
 type userLoginQueue struct {
@@ -141,8 +135,7 @@ func NewService(repo *Repository, cfg *config.Config, logger *zap.Logger, config
 		sentinelScript: scriptPathFromConfig(configPath),
 		sessions:       make(map[string]*sessionState),
 		batches:        make(map[string]*batchState),
-		cancelTasks:    make(map[string]*heroSMSCancelTask),
-		cancelNotify:   make(chan struct{}, 1),
+		cancels:        make(map[string]*PhoneCancelQueueItem),
 		userRuns:       make(map[int64]*userRunState),
 		emailRuns:      make(map[int64]*UserEmailRun),
 		loginQueues:    make(map[int64]*userLoginQueue),
@@ -189,13 +182,15 @@ func (s *Service) UserDashboard(ctx context.Context, userID int64) (*UserDashboa
 		return nil, err
 	}
 	return &UserDashboard{
-		User:           *user,
-		PageConfig:     pageConfig,
-		Summary:        summary,
-		LoginSummary:   loginSummary,
-		Run:            s.publicUserRun(user.ID),
-		EmailRun:       s.publicUserEmailRun(user.ID),
-		LatestAccounts: accounts,
+		User:             *user,
+		PageConfig:       pageConfig,
+		Summary:          summary,
+		LoginSummary:     loginSummary,
+		Run:              s.publicUserRun(user.ID),
+		PhoneQueue:       s.publicPhoneQueue(user.ID),
+		PhoneCancelQueue: s.publicPhoneCancelQueue(user.ID),
+		EmailRun:         s.publicUserEmailRun(user.ID),
+		LatestAccounts:   accounts,
 	}, nil
 }
 
@@ -411,6 +406,92 @@ func (s *Service) UploadUserAccountSub2API(ctx context.Context, req UserSub2APIU
 	}, nil
 }
 
+func (s *Service) RetryUserAccountLogin(ctx context.Context, req UserAccountRetryLoginRequest) (*UserDashboard, error) {
+	user, err := s.repo.GetRegisterUserByID(ctx, req.UserID)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(user.OTPEmail) == "" {
+		return nil, fmt.Errorf("请先配置接收验证码邮箱")
+	}
+	account, err := s.repo.GetUserAccountByID(ctx, user.ID, req.AccountID)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(account.Phone) == "" || strings.TrimSpace(account.Password) == "" {
+		return nil, fmt.Errorf("账号缺少手机号或密码，无法重新登录")
+	}
+	if account.Status != statusFailed && account.Status != "registered" && account.Status != "queued_login" {
+		return nil, fmt.Errorf("账号当前状态不允许重新登录上传")
+	}
+	pageConfig, err := s.resolvePageConfig(ctx, user.ID, req.PageConfig)
+	if err != nil {
+		return nil, err
+	}
+	customSub2API := req.CustomSub2API
+	if customSub2API == nil {
+		customSub2API = &pageConfig.CustomSub2API
+	}
+	options, err := validateUserRegisterRunOptions(customSub2API, pageConfigProxySnapshot(pageConfig))
+	if err != nil {
+		return nil, err
+	}
+
+	runID := newID()
+	now := time.Now()
+	run := &userRunState{
+		UserRun: UserRun{
+			ID:                    runID,
+			UserID:                user.ID,
+			Username:              user.Username,
+			Status:                statusRunning,
+			TargetCount:           1,
+			PhoneDone:             true,
+			PhoneSuccessCount:     1,
+			LoginQueuedCount:      1,
+			CurrentAccountID:      account.ID,
+			CurrentLoginAccountID: 0,
+			Step:                  fmt.Sprintf("账号 #%d 已重新进入登录上传队列", account.ID),
+			Logs: []UserRunLog{{
+				Time:    now,
+				Level:   "info",
+				Message: fmt.Sprintf("账号 #%d 已手动重新登录上传", account.ID),
+			}},
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+		waitingSessions:  make(map[string]struct{}),
+		settledSessions:  make(map[string]struct{}),
+		completedTargets: make(map[string]struct{}),
+	}
+
+	s.userMu.Lock()
+	if existing := s.userRuns[user.ID]; existing != nil && isActiveUserRunStatus(existing.Status) {
+		s.userMu.Unlock()
+		return nil, fmt.Errorf("当前用户已有运行中的注册任务")
+	}
+	s.userRuns[user.ID] = run
+	s.userMu.Unlock()
+
+	if err := s.repo.QueueUserAccountLogin(ctx, user.ID, account.ID); err != nil {
+		s.userMu.Lock()
+		if current := s.userRuns[user.ID]; current != nil && current.ID == runID {
+			delete(s.userRuns, user.ID)
+		}
+		s.userMu.Unlock()
+		return nil, err
+	}
+
+	session := s.newRetryLoginSession(*user, *account, runID, options)
+	s.enqueueUserLogin(userLoginTask{
+		UserID:    user.ID,
+		RunID:     runID,
+		SessionID: session.ID,
+		AccountID: account.ID,
+	})
+	return s.UserDashboard(ctx, user.ID)
+}
+
 func (s *Service) StartUserRegister(ctx context.Context, req UserRegisterStartRequest) (*UserDashboard, error) {
 	apiKey := strings.TrimSpace(req.APIKey)
 	if apiKey == "" {
@@ -449,6 +530,11 @@ func (s *Service) StartUserRegister(ctx context.Context, req UserRegisterStartRe
 	if err != nil {
 		return nil, err
 	}
+	options.Templates = enabledHeroSMSTemplates(pageConfig.HeroSMSTemplates)
+	if len(options.Templates) == 0 {
+		return nil, fmt.Errorf("请至少启用一个 HeroSMS 模板")
+	}
+	options.FastHandoffSeconds = pageConfig.HeroSMSFastHandoffSeconds
 
 	runCtx, cancel := context.WithCancel(context.Background())
 	now := time.Now()
@@ -468,7 +554,10 @@ func (s *Service) StartUserRegister(ctx context.Context, req UserRegisterStartRe
 			CreatedAt: now,
 			UpdatedAt: now,
 		},
-		cancel: cancel,
+		cancel:           cancel,
+		waitingSessions:  make(map[string]struct{}),
+		settledSessions:  make(map[string]struct{}),
+		completedTargets: make(map[string]struct{}),
 	}
 
 	s.userMu.Lock()
@@ -490,14 +579,16 @@ func (s *Service) StopUserRegister(ctx context.Context, userID int64) (*UserDash
 		return nil, err
 	}
 	currentSessionID := ""
+	runID := ""
 	s.userMu.Lock()
 	run := s.userRuns[user.ID]
 	if run != nil && isActiveUserRunStatus(run.Status) {
 		run.StopRequested = true
 		run.Status = statusRunning
-		run.Step = "已请求停止继续取号，当前激活会加入取消队列，已入队账号继续登录收尾"
+		run.Step = "已请求停止继续取号，当前激活会立即请求取消，已入队账号继续登录收尾"
 		run.UpdatedAt = time.Now()
 		currentSessionID = run.CurrentSessionID
+		runID = run.ID
 		if run.cancel != nil {
 			run.cancel()
 		}
@@ -506,6 +597,11 @@ func (s *Service) StopUserRegister(ctx context.Context, userID int64) (*UserDash
 	s.userMu.Unlock()
 	if currentSessionID != "" {
 		_, _ = s.Stop(currentSessionID)
+	}
+	if runID != "" {
+		for _, sessionID := range s.waitingUserPhoneSessionIDs(user.ID, runID, currentSessionID) {
+			_, _ = s.Stop(sessionID)
+		}
 	}
 	return s.UserDashboard(ctx, user.ID)
 }
@@ -595,7 +691,21 @@ func (s *Service) Stop(id string) (*Session, error) {
 	s.mu.Unlock()
 
 	if activationID != "" && apiKey != "" {
-		s.queueHeroSMSCancel(apiKey, activationID, phone, "manual_stop", heroSMSCancelDelay, smsProxy)
+		go func() {
+			result := s.cancelHeroSMSWithQueue(id, apiKey, activationID, phone, "manual_stop", time.Now(), smsProxy)
+			if errText := strings.TrimSpace(stringValue(result["error"])); errText != "" {
+				s.logger.Warn("HeroSMS manual stop cancel failed", zap.String("activation_id", activationID), zap.String("phone", phone), zap.String("error", errText))
+				return
+			}
+			s.logger.Info("HeroSMS manual stop canceled activation", zap.String("activation_id", activationID), zap.String("phone", phone))
+		}()
+	}
+	if snapshot.Status == statusWaitingPhoneCode && snapshot.UserID > 0 && snapshot.RunID != "" {
+		if s.userPhoneTargetReached(snapshot.UserID, snapshot.RunID) {
+			s.releaseUserPhoneWaiting(snapshot.UserID, snapshot.RunID, snapshot, "目标数量已满足，后台等待手机号已取消")
+		} else {
+			s.settleUserPhoneFailure(snapshot.UserID, snapshot.RunID, snapshot, "后台等待手机号验证码已停止")
+		}
 	}
 	return snapshot, nil
 }
@@ -666,7 +776,7 @@ func (s *Service) sendEmailCode(ctx context.Context, sessionID string) error {
 		if session.UserID <= 0 {
 			return fmt.Errorf("用户会话缺少 user_id，无法分配用户邮箱")
 		}
-		assigned, err := s.assignUnusedUserEmail(ctx, sessionID, session.UserID)
+		assigned, err := s.assignUnusedUserEmail(ctx, sessionID, session.UserID, session.AccountID)
 		if err != nil {
 			return err
 		}
@@ -870,13 +980,15 @@ func (s *Service) newSession(apiKey string, groupIDs []int64, step string, proxy
 			Status:          statusRunning,
 			Step:            step,
 			Template:        DefaultTemplate(),
+			Templates:       []HeroSMSTemplate{DefaultTemplate()},
 			GroupIDs:        normalizeGroupIDs(groupIDs),
 			CreatedAt:       now,
 			UpdatedAt:       now,
 			HeroSMSAttempts: []HeroSMSAttempt{},
 		},
-		apiKey: strings.TrimSpace(apiKey),
-		proxy:  proxy,
+		apiKey:             strings.TrimSpace(apiKey),
+		proxy:              proxy,
+		fastHandoffTimeout: heroSMSFastHandoffTimeout(0),
 	}
 	s.mu.Lock()
 	s.sessions[state.ID] = state
@@ -893,6 +1005,9 @@ func (s *Service) newUserSession(apiKey string, user RegisterUser, runID, step s
 		current.OTPMailbox = strings.TrimSpace(user.OTPEmail)
 		current.RunID = runID
 		current.sub2api = cloneCustomSub2APIConfig(options.Sub2API)
+		current.fastHandoffTimeout = heroSMSFastHandoffTimeout(options.FastHandoffSeconds)
+		current.Templates = enabledHeroSMSTemplates(options.Templates)
+		current.Template = current.Templates[0]
 		if current.sub2api != nil && current.sub2api.Enabled {
 			current.GroupIDs = normalizeGroupIDs(current.sub2api.GroupIDs)
 		} else {
@@ -902,6 +1017,80 @@ func (s *Service) newUserSession(apiKey string, user RegisterUser, runID, step s
 	}
 	s.mu.Unlock()
 	return state
+}
+
+func (s *Service) newRetryLoginSession(user RegisterUser, account UserAccount, runID string, options userRegisterRunOptions) *sessionState {
+	state := s.newSession("", []int64{user.GroupID}, fmt.Sprintf("账号 #%d 正在等待重新登录上传", account.ID), options.Proxy)
+	s.mu.Lock()
+	if current := s.sessions[state.ID]; current != nil {
+		current.UserID = user.ID
+		current.UserName = user.Username
+		current.OTPMailbox = strings.TrimSpace(user.OTPEmail)
+		current.AccountID = account.ID
+		current.UserEmailID = account.UserEmailID
+		current.RunID = runID
+		current.Phone = normalizePhone(account.Phone)
+		current.Email = strings.TrimSpace(account.Email)
+		current.Password = strings.TrimSpace(account.Password)
+		current.Name = strings.TrimSpace(account.Name)
+		current.Birthdate = strings.TrimSpace(account.Birthdate)
+		current.sub2api = cloneCustomSub2APIConfig(options.Sub2API)
+		if current.sub2api != nil && current.sub2api.Enabled {
+			current.GroupIDs = normalizeGroupIDs(current.sub2api.GroupIDs)
+		} else {
+			current.GroupIDs = normalizeGroupIDs([]int64{user.GroupID})
+		}
+		current.UpdatedAt = time.Now()
+	}
+	s.mu.Unlock()
+	return state
+}
+
+func enabledHeroSMSTemplates(templates []HeroSMSTemplate) []HeroSMSTemplate {
+	if len(templates) == 0 {
+		template := normalizeHeroSMSTemplate(DefaultTemplate())
+		template.Enabled = true
+		return []HeroSMSTemplate{template}
+	}
+	out := make([]HeroSMSTemplate, 0, len(templates))
+	for _, template := range templates {
+		normalized := normalizeHeroSMSTemplate(template)
+		if normalized.Enabled {
+			out = append(out, normalized)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].SortOrder == out[j].SortOrder {
+			return false
+		}
+		return out[i].SortOrder < out[j].SortOrder
+	})
+	return out
+}
+
+func (s *Service) setSessionHeroSMSTemplate(sessionID string, template HeroSMSTemplate) {
+	template = normalizeHeroSMSTemplate(template)
+	s.mu.Lock()
+	if current := s.sessions[sessionID]; current != nil {
+		current.Template = template
+		current.UpdatedAt = time.Now()
+	}
+	s.mu.Unlock()
+}
+
+func (s *Service) waitingUserPhoneSessionIDs(userID int64, runID, excludeSessionID string) []string {
+	out := []string{}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for id, session := range s.sessions {
+		if id == excludeSessionID || session == nil {
+			continue
+		}
+		if session.UserID == userID && session.RunID == runID && session.Status == statusWaitingPhoneCode {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 func (s *Service) runBatch(ctx context.Context, batchID string) {
@@ -983,7 +1172,7 @@ func (s *Service) runBatch(ctx context.Context, batchID string) {
 
 func (s *Service) runUserRegister(ctx context.Context, user RegisterUser, apiKey, runID string, count int, options userRegisterRunOptions) {
 	defer s.maybeFinishUserRun(user.ID, runID)
-	for i := 1; i <= count; i++ {
+	for {
 		if ctx.Err() != nil || s.isUserRunStopped(user.ID, runID) {
 			s.updateUserRun(user.ID, runID, func(run *userRunState) {
 				run.Status = statusRunning
@@ -994,18 +1183,31 @@ func (s *Service) runUserRegister(ctx context.Context, user RegisterUser, apiKey
 			return
 		}
 
-		session := s.newUserSession(apiKey, user, runID, fmt.Sprintf("注册 %d/%d：正在准备 HeroSMS 自动注册", i, count), options)
+		index, shouldStart, done := s.nextUserPhoneSlot(user.ID, runID)
+		if done {
+			break
+		}
+		if !shouldStart {
+			select {
+			case <-ctx.Done():
+				continue
+			case <-time.After(time.Second):
+			}
+			continue
+		}
+
+		session := s.newUserSession(apiKey, user, runID, fmt.Sprintf("注册 %d/%d：正在准备 HeroSMS 自动注册", index, count), options)
 		s.updateUserRun(user.ID, runID, func(run *userRunState) {
 			run.CurrentSessionID = session.ID
 			run.CurrentPhone = ""
 			run.CurrentAccountID = 0
 			run.PhoneCodeAttempt = 0
 			run.PhoneCodeMaxAttempts = 0
-			run.Step = fmt.Sprintf("正在处理第 %d/%d 个手机号", i, count)
+			run.Step = fmt.Sprintf("正在处理第 %d/%d 个手机号", index, count)
 			run.Logs = appendCappedRunLog(run.Logs, UserRunLog{
 				Time:    time.Now(),
 				Level:   "info",
-				Message: fmt.Sprintf("开始第 %d/%d 个手机号注册", i, count),
+				Message: fmt.Sprintf("开始第 %d/%d 个手机号注册", index, count),
 			})
 		})
 
@@ -1014,31 +1216,24 @@ func (s *Service) runUserRegister(ctx context.Context, user RegisterUser, apiKey
 		if snapshot == nil {
 			return
 		}
-		if snapshot.Status == statusSuccess && snapshot.AccountID > 0 {
-			if err := s.repo.UpdateUserAccountStatus(context.Background(), snapshot.AccountID, "queued_login", ""); err != nil {
-				s.logger.Warn("queue user account login status failed", zap.Int64("account_id", snapshot.AccountID), zap.Error(err))
-			}
+		if snapshot.Status == statusStopped && !s.isUserRunStopped(user.ID, runID) {
 			s.updateUserRun(user.ID, runID, func(run *userRunState) {
-				run.PhoneSuccessCount++
-				run.LoginQueuedCount++
-				run.CurrentSessionID = ""
-				run.CurrentPhone = snapshot.Phone
-				run.CurrentAccountID = snapshot.AccountID
+				if run.CurrentSessionID == snapshot.ID {
+					run.CurrentSessionID = ""
+				}
 				run.PhoneCodeAttempt = 0
 				run.PhoneCodeMaxAttempts = 0
-				run.Step = fmt.Sprintf("手机号注册完成 %d/%d，账号 #%d 已进入登录队列", run.PhoneSuccessCount, run.TargetCount, snapshot.AccountID)
-				run.Logs = appendCappedRunLog(run.Logs, UserRunLog{
-					Time:    time.Now(),
-					Level:   "ok",
-					Message: fmt.Sprintf("手机号 %s 注册成功，账号 #%d 已投递登录队列", snapshot.Phone, snapshot.AccountID),
-				})
+				run.Step = firstString(snapshot.Step, "当前取号队列已停止，继续检查目标数量")
+				run.Logs = appendCappedRunLog(run.Logs, UserRunLog{Time: time.Now(), Level: "warn", Message: run.Step})
 			})
-			s.enqueueUserLogin(userLoginTask{
-				UserID:    user.ID,
-				RunID:     runID,
-				SessionID: snapshot.ID,
-				AccountID: snapshot.AccountID,
-			})
+			continue
+		}
+		if snapshot.Status == statusSuccess && snapshot.AccountID > 0 {
+			s.settleUserPhoneSuccess(user.ID, runID, snapshot)
+			continue
+		}
+		if snapshot.Status == statusWaitingPhoneCode {
+			s.markUserPhoneWaiting(user.ID, runID, snapshot)
 			continue
 		}
 		if snapshot.Status == statusStopped || ctx.Err() != nil {
@@ -1051,17 +1246,7 @@ func (s *Service) runUserRegister(ctx context.Context, user RegisterUser, apiKey
 			})
 			return
 		}
-		s.updateUserRun(user.ID, runID, func(run *userRunState) {
-			run.PhoneFailureCount++
-			run.PhoneCodeAttempt = 0
-			run.PhoneCodeMaxAttempts = 0
-			run.Step = fmt.Sprintf("第 %d 个手机号失败，继续下一个", i)
-			run.Logs = appendCappedRunLog(run.Logs, UserRunLog{
-				Time:    time.Now(),
-				Level:   "error",
-				Message: fmt.Sprintf("第 %d 个手机号失败：%s", i, firstString(snapshot.Error, snapshot.Step, "未知错误")),
-			})
-		})
+		s.settleUserPhoneFailure(user.ID, runID, snapshot, fmt.Sprintf("第 %d 个手机号失败，继续下一个", index))
 	}
 	s.updateUserRun(user.ID, runID, func(run *userRunState) {
 		run.PhoneDone = true
@@ -1070,6 +1255,319 @@ func (s *Service) runUserRegister(ctx context.Context, user RegisterUser, apiKey
 		run.Step = "手机号注册阶段已完成，等待登录队列处理剩余账号"
 		run.Logs = appendCappedRunLog(run.Logs, UserRunLog{Time: time.Now(), Level: "info", Message: "手机号注册阶段已完成"})
 	})
+}
+
+func (s *Service) nextUserPhoneSlot(userID int64, runID string) (int, bool, bool) {
+	s.userMu.RLock()
+	defer s.userMu.RUnlock()
+	run := s.userRuns[userID]
+	if run == nil || run.ID != runID {
+		return 0, false, true
+	}
+	if run.StopRequested {
+		return 0, false, true
+	}
+	if run.PhoneDone {
+		return 0, false, true
+	}
+	if run.PhoneSuccessCount >= run.TargetCount {
+		return 0, false, true
+	}
+	if run.PhoneSuccessCount+run.PhoneWaitingCount >= run.TargetCount {
+		return 0, false, false
+	}
+	if run.CurrentSessionID != "" {
+		return 0, false, false
+	}
+	return run.PhoneSuccessCount + run.PhoneWaitingCount + run.PhoneFailureCount + 1, true, false
+}
+
+func (s *Service) markUserPhoneWaiting(userID int64, runID string, snapshot *Session) {
+	if snapshot == nil {
+		return
+	}
+	targetOccupied := false
+	s.updateUserRun(userID, runID, func(run *userRunState) {
+		if run.waitingSessions == nil {
+			run.waitingSessions = make(map[string]struct{})
+		}
+		if _, exists := run.waitingSessions[snapshot.ID]; exists {
+			return
+		}
+		run.waitingSessions[snapshot.ID] = struct{}{}
+		run.PhoneWaitingCount++
+		run.CurrentSessionID = ""
+		run.CurrentPhone = snapshot.Phone
+		run.CurrentAccountID = 0
+		run.PhoneCodeAttempt = 0
+		run.PhoneCodeMaxAttempts = 0
+		run.Step = firstString(snapshot.Step, fmt.Sprintf("手机号 %s 已等待短信超时，后台继续等待并获取下一个手机号", snapshot.Phone))
+		run.Logs = appendCappedRunLog(run.Logs, UserRunLog{
+			Time:    time.Now(),
+			Level:   "warn",
+			Message: run.Step,
+		})
+		targetOccupied = run.PhoneSuccessCount+run.PhoneWaitingCount >= run.TargetCount
+	})
+	if targetOccupied {
+		s.stopUnassignedUserPhoneSessions(userID, runID, snapshot.ID, "目标数量已占满，停止未取到手机号的队列")
+	}
+}
+
+func (s *Service) reserveUserPhoneSuccessTarget(userID int64, runID, sessionID string) string {
+	s.userMu.Lock()
+	defer s.userMu.Unlock()
+	run := s.userRuns[userID]
+	if run == nil || run.ID != runID {
+		return "missing"
+	}
+	if run.completedTargets == nil {
+		run.completedTargets = make(map[string]struct{})
+	}
+	if run.settledSessions == nil {
+		run.settledSessions = make(map[string]struct{})
+	}
+	if _, exists := run.settledSessions[sessionID]; exists {
+		return "settled"
+	}
+	if _, exists := run.completedTargets[sessionID]; exists {
+		return "settled"
+	}
+	if run.PhoneSuccessCount+len(run.completedTargets) >= run.TargetCount {
+		return "full"
+	}
+	run.completedTargets[sessionID] = struct{}{}
+	return "reserved"
+}
+
+func (s *Service) settleUserPhoneSuccess(userID int64, runID string, snapshot *Session) {
+	if snapshot == nil || snapshot.AccountID <= 0 {
+		return
+	}
+	switch s.reserveUserPhoneSuccessTarget(userID, runID, snapshot.ID) {
+	case "reserved":
+	case "full":
+		if snapshot.AccountID > 0 {
+			_ = s.repo.UpdateUserAccountStatus(context.Background(), snapshot.AccountID, statusFailed, "注册目标数量已满足，未进入登录队列")
+		}
+		s.releaseUserPhoneWaiting(userID, runID, snapshot, "目标数量已满足，额外手机号注册结果已跳过")
+		return
+	default:
+		return
+	}
+	if err := s.repo.UpdateUserAccountStatus(context.Background(), snapshot.AccountID, "queued_login", ""); err != nil {
+		s.logger.Warn("queue user account login status failed", zap.Int64("account_id", snapshot.AccountID), zap.Error(err))
+	}
+	s.updateUserRun(userID, runID, func(run *userRunState) {
+		if run.settledSessions == nil {
+			run.settledSessions = make(map[string]struct{})
+		}
+		if run.completedTargets == nil {
+			run.completedTargets = make(map[string]struct{})
+		}
+		delete(run.completedTargets, snapshot.ID)
+		if run.waitingSessions == nil {
+			run.waitingSessions = make(map[string]struct{})
+		}
+		if _, wasWaiting := run.waitingSessions[snapshot.ID]; wasWaiting && run.PhoneWaitingCount > 0 {
+			run.PhoneWaitingCount--
+			delete(run.waitingSessions, snapshot.ID)
+		}
+		run.settledSessions[snapshot.ID] = struct{}{}
+		run.PhoneSuccessCount++
+		run.LoginQueuedCount++
+		run.CurrentSessionID = ""
+		run.CurrentPhone = snapshot.Phone
+		run.CurrentAccountID = snapshot.AccountID
+		run.PhoneCodeAttempt = 0
+		run.PhoneCodeMaxAttempts = 0
+		if run.PhoneSuccessCount >= run.TargetCount {
+			run.PhoneDone = true
+		}
+		run.Step = fmt.Sprintf("手机号注册完成 %d/%d，账号 #%d 已进入登录队列", run.PhoneSuccessCount, run.TargetCount, snapshot.AccountID)
+		run.Logs = appendCappedRunLog(run.Logs, UserRunLog{
+			Time:    time.Now(),
+			Level:   "ok",
+			Message: fmt.Sprintf("手机号 %s 注册成功，账号 #%d 已投递登录队列", snapshot.Phone, snapshot.AccountID),
+		})
+	})
+	s.enqueueUserLogin(userLoginTask{
+		UserID:    userID,
+		RunID:     runID,
+		SessionID: snapshot.ID,
+		AccountID: snapshot.AccountID,
+	})
+	if s.userPhoneTargetOccupied(userID, runID) {
+		s.stopUnassignedUserPhoneSessions(userID, runID, snapshot.ID, "目标数量已满足，停止未取到手机号的队列")
+	}
+}
+
+func (s *Service) userPhoneTargetReached(userID int64, runID string) bool {
+	if userID <= 0 || strings.TrimSpace(runID) == "" {
+		return false
+	}
+	s.userMu.RLock()
+	defer s.userMu.RUnlock()
+	run := s.userRuns[userID]
+	return run != nil && run.ID == runID && run.PhoneSuccessCount >= run.TargetCount
+}
+
+func (s *Service) userPhoneTargetOccupied(userID int64, runID string) bool {
+	if userID <= 0 || strings.TrimSpace(runID) == "" {
+		return false
+	}
+	s.userMu.RLock()
+	defer s.userMu.RUnlock()
+	run := s.userRuns[userID]
+	return run != nil && run.ID == runID && run.PhoneSuccessCount+run.PhoneWaitingCount >= run.TargetCount
+}
+
+func (s *Service) settleUserPhoneFailure(userID int64, runID string, snapshot *Session, step string) {
+	if snapshot == nil {
+		return
+	}
+	stepText := strings.TrimSpace(step)
+	if stepText == "" {
+		stepText = "手机号注册失败，继续下一个"
+	}
+	s.updateUserRun(userID, runID, func(run *userRunState) {
+		if run.settledSessions == nil {
+			run.settledSessions = make(map[string]struct{})
+		}
+		if _, alreadySettled := run.settledSessions[snapshot.ID]; alreadySettled {
+			return
+		}
+		if run.waitingSessions == nil {
+			run.waitingSessions = make(map[string]struct{})
+		}
+		if _, wasWaiting := run.waitingSessions[snapshot.ID]; wasWaiting {
+			if run.PhoneWaitingCount > 0 {
+				run.PhoneWaitingCount--
+			}
+			delete(run.waitingSessions, snapshot.ID)
+		}
+		run.settledSessions[snapshot.ID] = struct{}{}
+		run.PhoneFailureCount++
+		run.PhoneCodeAttempt = 0
+		run.PhoneCodeMaxAttempts = 0
+		run.Step = stepText
+		run.Logs = appendCappedRunLog(run.Logs, UserRunLog{
+			Time:    time.Now(),
+			Level:   "error",
+			Message: fmt.Sprintf("%s：%s", stepText, firstString(snapshot.Error, snapshot.Step, "未知错误")),
+		})
+	})
+	s.maybeFinishUserRun(userID, runID)
+}
+
+func (s *Service) settleUserPhoneTerminalFailure(userID int64, runID string, snapshot *Session, step string) {
+	if snapshot == nil {
+		return
+	}
+	stepText := strings.TrimSpace(step)
+	if stepText == "" {
+		stepText = "手机号验证码已获取，OpenAI 后续注册失败"
+	}
+	s.updateUserRun(userID, runID, func(run *userRunState) {
+		if run.settledSessions == nil {
+			run.settledSessions = make(map[string]struct{})
+		}
+		if _, alreadySettled := run.settledSessions[snapshot.ID]; alreadySettled {
+			return
+		}
+		if run.waitingSessions == nil {
+			run.waitingSessions = make(map[string]struct{})
+		}
+		if _, wasWaiting := run.waitingSessions[snapshot.ID]; wasWaiting {
+			if run.PhoneWaitingCount > 0 {
+				run.PhoneWaitingCount--
+			}
+			delete(run.waitingSessions, snapshot.ID)
+		}
+		run.settledSessions[snapshot.ID] = struct{}{}
+		run.PhoneFailureCount++
+		run.PhoneDone = true
+		run.CurrentSessionID = ""
+		run.CurrentPhone = snapshot.Phone
+		run.CurrentAccountID = 0
+		run.PhoneCodeAttempt = 0
+		run.PhoneCodeMaxAttempts = 0
+		run.Step = stepText
+		run.Logs = appendCappedRunLog(run.Logs, UserRunLog{
+			Time:    time.Now(),
+			Level:   "error",
+			Message: fmt.Sprintf("%s：%s", stepText, firstString(snapshot.Error, snapshot.Step, "未知错误")),
+		})
+	})
+	s.stopUnassignedUserPhoneSessions(userID, runID, snapshot.ID, "OpenAI 后续注册失败，停止未取到手机号的队列")
+	s.maybeFinishUserRun(userID, runID)
+}
+
+func (s *Service) stopUnassignedUserPhoneSessions(userID int64, runID, excludeSessionID, step string) {
+	step = strings.TrimSpace(step)
+	if step == "" {
+		step = "已停止未取到手机号的队列"
+	}
+	sessionIDs := []string{}
+	s.mu.RLock()
+	for id, session := range s.sessions {
+		if session == nil || id == excludeSessionID || session.UserID != userID || session.RunID != runID {
+			continue
+		}
+		if session.HeroSMSActivationID == "" && strings.TrimSpace(session.Phone) == "" && (session.Status == statusRunning || session.Status == statusCreated) {
+			sessionIDs = append(sessionIDs, id)
+		}
+	}
+	s.mu.RUnlock()
+	for _, sessionID := range sessionIDs {
+		s.mu.Lock()
+		if session := s.sessions[sessionID]; session != nil {
+			session.StopRequested = true
+			session.Status = statusStopped
+			session.Step = step
+			session.UpdatedAt = time.Now()
+			if session.workerCancel != nil {
+				session.workerCancel()
+			}
+		}
+		s.mu.Unlock()
+		s.logUserRunForSession(sessionID, "warn", step)
+		s.closeAuthSession(sessionID)
+	}
+}
+
+func (s *Service) releaseUserPhoneWaiting(userID int64, runID string, snapshot *Session, step string) {
+	if snapshot == nil {
+		return
+	}
+	stepText := strings.TrimSpace(step)
+	if stepText == "" {
+		stepText = "后台等待手机号已取消"
+	}
+	s.updateUserRun(userID, runID, func(run *userRunState) {
+		if run.waitingSessions == nil {
+			run.waitingSessions = make(map[string]struct{})
+		}
+		if _, wasWaiting := run.waitingSessions[snapshot.ID]; wasWaiting {
+			if run.PhoneWaitingCount > 0 {
+				run.PhoneWaitingCount--
+			}
+			delete(run.waitingSessions, snapshot.ID)
+		}
+		if run.settledSessions == nil {
+			run.settledSessions = make(map[string]struct{})
+		}
+		run.settledSessions[snapshot.ID] = struct{}{}
+		run.PhoneCodeAttempt = 0
+		run.PhoneCodeMaxAttempts = 0
+		run.Step = stepText
+		run.Logs = appendCappedRunLog(run.Logs, UserRunLog{
+			Time:    time.Now(),
+			Level:   "warn",
+			Message: fmt.Sprintf("%s：%s", stepText, snapshot.Phone),
+		})
+	})
+	s.maybeFinishUserRun(userID, runID)
 }
 
 func (s *Service) enqueueUserLogin(task userLoginTask) {
@@ -1133,7 +1631,7 @@ func (s *Service) processUserLoginTask(task userLoginTask) {
 	})
 	_ = s.repo.UpdateUserAccountStatus(ctx, task.AccountID, "login_running", "")
 
-	email, err := s.assignUnusedUserEmail(ctx, task.SessionID, user.ID)
+	email, err := s.assignUnusedUserEmail(ctx, task.SessionID, user.ID, task.AccountID)
 	if err != nil {
 		s.failUserLoginTask(task, err)
 		return
@@ -1205,7 +1703,13 @@ func (s *Service) runHeroSMSAutoRegister(ctx context.Context, sessionID string) 
 		return
 	}
 	apiKey := session.apiKey
-	template := session.Template
+	templates := enabledHeroSMSTemplates(session.Templates)
+	if len(templates) == 0 {
+		s.touch(sessionID, statusFailed, "HeroSMS 自动注册失败", "请至少启用一个 HeroSMS 模板", nil)
+		s.logUserRunForSession(sessionID, "error", "HeroSMS 自动注册失败：请至少启用一个 HeroSMS 模板")
+		s.closeAuthSession(sessionID)
+		return
+	}
 	attempt := 0
 
 	for {
@@ -1214,129 +1718,242 @@ func (s *Service) runHeroSMSAutoRegister(ctx context.Context, sessionID string) 
 			s.closeAuthSession(sessionID)
 			return
 		}
-		attempt++
-		phone := ""
-		activationID := ""
-		activationFinished := false
-		tryCtx, cancel := context.WithTimeout(ctx, 7*time.Minute)
-		err := func() error {
-			s.closeAuthSession(sessionID)
-			step := fmt.Sprintf("正在用 HeroSMS 模板 %s 获取手机号（第 %d 次）", template.Name, attempt)
-			s.touch(sessionID, statusRunning, step, "", nil)
-			s.logUserRunForSession(sessionID, "info", step)
-			numberData, err := s.heroSMS.GetNumber(tryCtx, apiKey, template, session.proxy.forSMS())
-			if err != nil {
-				return err
+		cycleNoNumber := true
+		for templateIndex, template := range templates {
+			if s.isSessionStopped(sessionID) || ctx.Err() != nil {
+				s.touch(sessionID, statusStopped, "已停止获取手机号，可切换后重新开始", "", nil)
+				s.closeAuthSession(sessionID)
+				return
 			}
-			phone = normalizePhone(firstString(stringValue(numberData["phone_number"]), stringValue(numberData["phoneNumber"])))
-			activationID = strings.TrimSpace(stringValue(numberData["activationId"]))
-			if phone == "" || activationID == "" {
-				return fmt.Errorf("HeroSMS 返回缺少手机号或激活 ID: %s", previewJSON(numberData))
-			}
+			attempt++
+			phone := ""
+			activationID := ""
+			cancelAt := time.Time{}
+			activationFinished := false
+			tryCtx, cancel := context.WithTimeout(ctx, 7*time.Minute)
+			err := func() error {
+				s.closeAuthSession(sessionID)
+				step := fmt.Sprintf("正在用 HeroSMS 模板 %s 获取手机号（第 %d 次，模板 %d/%d）", template.Name, attempt, templateIndex+1, len(templates))
+				s.setSessionHeroSMSTemplate(sessionID, template)
+				s.touch(sessionID, statusRunning, step, "", nil)
+				s.logUserRunForSession(sessionID, "info", step)
+				numberData, err := s.heroSMS.GetNumber(tryCtx, apiKey, template, session.proxy.forSMS())
+				if err != nil {
+					return err
+				}
+				cycleNoNumber = false
+				phone = normalizePhone(firstString(stringValue(numberData["phone_number"]), stringValue(numberData["phoneNumber"])))
+				activationID = strings.TrimSpace(stringValue(numberData["activationId"]))
+				if phone == "" || activationID == "" {
+					return fmt.Errorf("HeroSMS 返回缺少手机号或激活 ID: %s", previewJSON(numberData))
+				}
+				cancelAt = time.Now().Add(heroSMSCancelDelay)
 
-			exists, err := s.repo.PhoneExists(tryCtx, phone)
-			if err != nil {
-				s.logger.Warn("phone exists check failed", zap.Error(err))
-			}
-			if exists {
-				cancelData := s.queueHeroSMSCancel(apiKey, activationID, phone, "phone_exists", heroSMSCancelDelay, session.proxy.forSMS())
-				step := fmt.Sprintf("手机号 %s 已存在，已加入取消队列，继续重新获取手机号", phone)
-				s.touch(sessionID, statusRunning, step, "", map[string]any{"number": numberData, "cancel_queue": cancelData})
-				s.logUserRunForSession(sessionID, "warn", step)
-				return nil
-			}
-
-			s.mu.Lock()
-			if current := s.sessions[sessionID]; current != nil {
-				current.Phone = phone
-				current.HeroSMSActivationID = activationID
-				current.HeroSMSAttempt = attempt
-				current.HeroSMSAttempts = append(current.HeroSMSAttempts, HeroSMSAttempt{
-					Attempt:      attempt,
-					ActivationID: activationID,
-					Phone:        phone,
-					Number:       numberData,
-				})
-				current.RawResponse = cloneMap(numberData)
-				current.Step = fmt.Sprintf("已获取手机号 %s，正在发送注册短信", phone)
-				current.UpdatedAt = time.Now()
-			}
-			s.mu.Unlock()
-			s.logUserRunForSession(sessionID, "info", fmt.Sprintf("已获取手机号 %s，激活 ID %s，正在发送注册短信", phone, activationID))
-
-			if err := s.beginPhoneRegister(tryCtx, sessionID); err != nil {
-				return err
-			}
-			s.touch(sessionID, statusRunning, "手机号验证码已发送，正在等待 HeroSMS 验证码", "", nil)
-			s.logUserRunForSession(sessionID, "info", fmt.Sprintf("手机号 %s 验证码已发送，正在等待 HeroSMS 返回验证码", phone))
-			code, err := s.waitHeroSMSCode(tryCtx, sessionID, apiKey, activationID)
-			if err != nil {
-				return err
-			}
-			if code == "" {
-				cancelData := s.queueHeroSMSCancel(apiKey, activationID, phone, "sms_timeout", 0, session.proxy.forSMS())
-				if s.isSessionStopped(sessionID) {
-					s.touch(sessionID, statusStopped, "已停止获取手机号，当前激活已加入取消队列", "", map[string]any{"activation_id": activationID, "phone": phone, "cancel_queue": cancelData})
-					s.logUserRunForSession(sessionID, "warn", fmt.Sprintf("已停止，手机号 %s 当前激活已加入取消队列", phone))
+				exists, err := s.repo.PhoneExists(tryCtx, phone)
+				if err != nil {
+					s.logger.Warn("phone exists check failed", zap.Error(err))
+				}
+				if exists {
+					cancelData := s.waitAndCancelHeroSMS(tryCtx, sessionID, apiKey, activationID, phone, "phone_exists", cancelAt, session.proxy.forSMS())
+					if boolValue(cancelData["stopped"]) || s.isSessionStopped(sessionID) || tryCtx.Err() != nil {
+						s.touch(sessionID, statusStopped, "已停止获取手机号，可切换后重新开始", "", map[string]any{
+							"activation_id": activationID,
+							"phone":         phone,
+							"cancel_result": cancelData,
+						})
+						s.logUserRunForSession(sessionID, "warn", "已停止获取手机号")
+						return nil
+					}
+					step := fmt.Sprintf("手机号 %s 已存在，当前激活已到取消时间并取消，继续重新获取手机号", phone)
+					s.touch(sessionID, statusRunning, step, "", map[string]any{"number": numberData, "cancel_result": cancelData})
+					s.logUserRunForSession(sessionID, "warn", step)
 					return nil
 				}
-				s.touch(sessionID, statusRunning, "2分30秒未获取到手机号验证码，已加入取消队列并继续用当前模板重新获取手机号", "", map[string]any{
-					"activation_id": activationID,
-					"phone":         phone,
-					"message":       "HeroSMS 2分30秒未返回验证码",
-					"cancel_queue":  cancelData,
-				})
-				s.logUserRunForSession(sessionID, "warn", fmt.Sprintf("手机号 %s 等待 2 分 30 秒未收到验证码，已加入取消队列，继续重新获取手机号", phone))
+
+				s.mu.Lock()
+				if current := s.sessions[sessionID]; current != nil {
+					current.Phone = phone
+					current.HeroSMSActivationID = activationID
+					current.HeroSMSAttempt = attempt
+					current.HeroSMSAttempts = append(current.HeroSMSAttempts, HeroSMSAttempt{
+						Attempt:      attempt,
+						ActivationID: activationID,
+						Phone:        phone,
+						Number:       numberData,
+					})
+					current.RawResponse = cloneMap(numberData)
+					current.Step = fmt.Sprintf("已获取手机号 %s，正在发送注册短信", phone)
+					current.UpdatedAt = time.Now()
+				}
+				s.mu.Unlock()
+				s.logUserRunForSession(sessionID, "info", fmt.Sprintf("已获取手机号 %s，激活 ID %s，正在发送注册短信", phone, activationID))
+
+				if err := s.beginPhoneRegisterUntilCancel(tryCtx, sessionID, phone, cancelAt); err != nil {
+					return err
+				}
+				s.touch(sessionID, statusRunning, "手机号验证码已发送，正在等待 HeroSMS 验证码", "", nil)
+				s.logUserRunForSession(sessionID, "info", fmt.Sprintf("手机号 %s 验证码已发送，正在等待 HeroSMS 返回验证码", phone))
+				waitTimeout := time.Until(cancelAt)
+				fastHandoff := s.shouldFastHandoffPhoneCode(sessionID)
+				fastHandoffTimeout := s.heroSMSFastHandoffTimeout(sessionID)
+				if fastHandoff && waitTimeout > fastHandoffTimeout {
+					waitTimeout = fastHandoffTimeout
+				}
+				code, err := s.waitHeroSMSCodeWithTimeout(tryCtx, sessionID, apiKey, activationID, waitTimeout)
+				if err != nil {
+					return err
+				}
+				if code == "" {
+					if s.isSessionStopped(sessionID) {
+						s.touch(sessionID, statusStopped, "已停止获取手机号，当前激活已请求取消", "", map[string]any{"activation_id": activationID, "phone": phone})
+						s.logUserRunForSession(sessionID, "warn", fmt.Sprintf("已停止，手机号 %s 当前激活已请求取消", phone))
+						return nil
+					}
+					if fastHandoff && time.Now().Before(cancelAt) {
+						step := fmt.Sprintf("手机号 %s 等待 %d 秒未收到验证码，后台继续等待并获取下一个手机号", phone, int(fastHandoffTimeout.Seconds()))
+						s.touch(sessionID, statusWaitingPhoneCode, step, "", map[string]any{
+							"activation_id":        activationID,
+							"phone":                phone,
+							"cancel_at":            cancelAt.Format(time.RFC3339),
+							"fast_handoff_seconds": int(fastHandoffTimeout.Seconds()),
+						})
+						s.logUserRunForSession(sessionID, "warn", step)
+						go s.finishWaitingHeroSMSActivation(ctx, sessionID, apiKey, activationID, phone, cancelAt, session.proxy.forSMS())
+						return nil
+					}
+					cancelData := s.cancelHeroSMSWithQueue(sessionID, apiKey, activationID, phone, "phone_code_timeout", time.Now(), session.proxy.forSMS())
+					s.touch(sessionID, statusRunning, "取消时间前仍未获取到手机号验证码，当前激活已取消并继续获取新手机号", "", map[string]any{
+						"activation_id": activationID,
+						"phone":         phone,
+						"message":       "HeroSMS 取消时间前未返回验证码",
+						"cancel_result": cancelData,
+					})
+					s.logUserRunForSession(sessionID, "warn", fmt.Sprintf("手机号 %s 到取消时间仍未收到验证码，已取消当前激活，继续获取新手机号", phone))
+					return nil
+				}
+				s.touch(sessionID, statusPhoneCodeSent, "已获取手机号验证码，正在自动确认", "", nil)
+				s.logUserRunForSession(sessionID, "info", fmt.Sprintf("手机号 %s 已获取验证码，正在自动确认", phone))
+				activationFinished = true
+				if err := s.verifyPhoneCode(tryCtx, sessionID, code); err != nil {
+					return err
+				}
+				s.completeHeroSMS(apiKey, activationID, session.proxy.forSMS())
 				return nil
+			}()
+			cancel()
+			waitNextTemplate := func() bool {
+				if templateIndex >= len(templates)-1 {
+					return false
+				}
+				if s.sleepWithStop(ctx, sessionID, heroSMSTemplateTryInterval) {
+					s.touch(sessionID, statusStopped, "已停止获取手机号，可切换后重新开始", "", nil)
+					s.logUserRunForSession(sessionID, "warn", "已停止获取手机号")
+					s.closeAuthSession(sessionID)
+					return true
+				}
+				return false
 			}
-			s.touch(sessionID, statusPhoneCodeSent, "已获取手机号验证码，正在自动确认", "", nil)
-			s.logUserRunForSession(sessionID, "info", fmt.Sprintf("手机号 %s 已获取验证码，正在自动确认", phone))
-			if err := s.verifyPhoneCode(tryCtx, sessionID, code); err != nil {
-				return err
+			if err == nil {
+				snapshot := s.publicSession(sessionID)
+				if snapshot != nil && isTerminalOrWaitingStatus(snapshot.Status) {
+					if snapshot.Status == statusRegistrationBlocked && snapshot.UserID > 0 && snapshot.RunID != "" {
+						s.settleUserPhoneTerminalFailure(snapshot.UserID, snapshot.RunID, snapshot, "OpenAI 后续注册失败")
+					}
+					return
+				}
+				if waitNextTemplate() {
+					return
+				}
+				continue
 			}
-			s.completeHeroSMS(apiKey, activationID, session.proxy.forSMS())
-			activationFinished = true
-			return nil
-		}()
-		cancel()
-		if err == nil {
-			snapshot := s.publicSession(sessionID)
-			if snapshot != nil && isTerminalOrWaitingStatus(snapshot.Status) {
+
+			s.logger.Warn("HeroSMS phone register attempt failed", zap.Int("attempt", attempt), zap.String("template", template.Name), zap.Error(err))
+			if activationFinished {
+				s.touch(sessionID, statusFailed, "手机号验证码已获取，OpenAI 后续注册失败", err.Error(), nil)
+				s.closeAuthSession(sessionID)
+				if snapshot := s.publicSession(sessionID); snapshot != nil && snapshot.UserID > 0 && snapshot.RunID != "" {
+					s.settleUserPhoneTerminalFailure(snapshot.UserID, snapshot.RunID, snapshot, "手机号验证码已获取，OpenAI 后续注册失败")
+				}
+				return
+			}
+			if activationID != "" && !activationFinished {
+				reason := truncate(err.Error(), 120)
+				if s.shouldFastHandoffPhoneCode(sessionID) {
+					wait, normalizedCancelAt := heroSMSCancelWait(cancelAt)
+					s.markHeroSMSCancelQueue(sessionID, activationID, phone, reason, normalizedCancelAt)
+					s.scheduleHeroSMSCancelAt(ctx, sessionID, apiKey, activationID, phone, reason, normalizedCancelAt, session.proxy.forSMS())
+					step := fmt.Sprintf("手机号 %s 不可用于新注册，当前激活将在 %d 秒后后台取消，继续获取下一个手机号", phone, int(wait.Seconds()))
+					s.touch(sessionID, statusRunning, step, err.Error(), map[string]any{
+						"activation_id":  activationID,
+						"phone":          phone,
+						"error":          err.Error(),
+						"cancel_at":      normalizedCancelAt.Format(time.RFC3339),
+						"delay_seconds":  int(wait.Seconds()),
+						"cancel_in_back": true,
+					})
+					s.closeAuthSession(sessionID)
+				} else {
+					cancelData := s.waitAndCancelHeroSMS(ctx, sessionID, apiKey, activationID, phone, reason, cancelAt, session.proxy.forSMS())
+					if boolValue(cancelData["stopped"]) || s.isSessionStopped(sessionID) || ctx.Err() != nil {
+						s.touch(sessionID, statusStopped, "已停止获取手机号，可切换后重新开始", "", map[string]any{
+							"activation_id": activationID,
+							"phone":         phone,
+							"cancel_result": cancelData,
+						})
+						s.logUserRunForSession(sessionID, "warn", "已停止获取手机号")
+						s.closeAuthSession(sessionID)
+						return
+					}
+					s.touch(sessionID, statusRunning, fmt.Sprintf("手机号 %s 不可用于新注册，当前激活已取消", phone), "", map[string]any{
+						"activation_id": activationID,
+						"phone":         phone,
+						"error":         err.Error(),
+						"cancel_result": cancelData,
+					})
+					s.logUserRunForSession(sessionID, "warn", fmt.Sprintf("手机号 %s 不可用于新注册，当前激活已取消：%s", phone, reason))
+				}
+			}
+			if s.isSessionStopped(sessionID) || ctx.Err() != nil {
+				s.touch(sessionID, statusStopped, "已停止获取手机号，可切换后重新开始", "", nil)
+				s.logUserRunForSession(sessionID, "warn", "已停止获取手机号")
+				s.closeAuthSession(sessionID)
+				return
+			}
+			if IsHeroSMSNoNumbersError(err) {
+				step := fmt.Sprintf("HeroSMS 模板 %s 暂无号码，继续轮询下一个启用模板", template.Name)
+				s.touch(sessionID, statusRunning, step, "", map[string]any{"error": err.Error(), "attempt": attempt, "template": template})
+				s.logUserRunForSession(sessionID, "info", fmt.Sprintf("%s；原因：%s", step, err.Error()))
+				if waitNextTemplate() {
+					return
+				}
+				continue
+			}
+			cycleNoNumber = false
+			step := fmt.Sprintf("当前手机号不可用或获取失败，继续获取下一个手机号（第 %d 次）", attempt+1)
+			if !isRetryablePhoneAttemptError(err) {
+				step = fmt.Sprintf("当前请求失败，继续重试获取手机号（第 %d 次）", attempt+1)
+			}
+			s.touch(sessionID, statusRunning, step, "", nil)
+			s.logUserRunForSession(sessionID, "info", fmt.Sprintf("%s；上次失败原因：%s", step, err.Error()))
+			if waitNextTemplate() {
+				return
+			}
+		}
+		if !cycleNoNumber {
+			step := fmt.Sprintf("本轮 HeroSMS 模板已尝试完成，%d 秒后继续下一轮", int(heroSMSNumberRetryInterval.Seconds()))
+			s.touch(sessionID, statusRunning, step, "", map[string]any{"attempt": attempt, "templates": templates})
+			s.logUserRunForSession(sessionID, "info", step)
+			if s.sleepWithStop(ctx, sessionID, heroSMSNumberRetryInterval) {
+				s.touch(sessionID, statusStopped, "已停止获取手机号，可切换后重新开始", "", nil)
+				s.logUserRunForSession(sessionID, "warn", "已停止获取手机号")
+				s.closeAuthSession(sessionID)
 				return
 			}
 			continue
 		}
-
-		s.logger.Warn("HeroSMS phone register attempt failed", zap.Int("attempt", attempt), zap.Error(err))
-		if activationID != "" && !activationFinished {
-			reason := truncate(err.Error(), 120)
-			cancelData := s.queueHeroSMSCancel(apiKey, activationID, phone, reason, heroSMSCancelDelay, session.proxy.forSMS())
-			s.touch(sessionID, statusRunning, fmt.Sprintf("手机号 %s 不可用于新注册，已加入取消队列", phone), "", map[string]any{
-				"activation_id": activationID,
-				"phone":         phone,
-				"error":         err.Error(),
-				"cancel_queue":  cancelData,
-			})
-			s.logUserRunForSession(sessionID, "warn", fmt.Sprintf("手机号 %s 不可用于新注册，已加入取消队列：%s", phone, reason))
-		}
-		if s.isSessionStopped(sessionID) || ctx.Err() != nil {
-			s.touch(sessionID, statusStopped, "已停止获取手机号，可切换后重新开始", "", nil)
-			s.logUserRunForSession(sessionID, "warn", "已停止获取手机号")
-			s.closeAuthSession(sessionID)
-			return
-		}
-		if !isRetryablePhoneAttemptError(err) {
-			s.touch(sessionID, statusFailed, "HeroSMS 自动注册失败", err.Error(), nil)
-			s.logUserRunForSession(sessionID, "error", fmt.Sprintf("HeroSMS 自动注册失败：%s", err.Error()))
-			s.closeAuthSession(sessionID)
-			return
-		}
-		step := fmt.Sprintf("当前手机号不可用或获取失败，%d 秒后继续获取（第 %d 次）", int(heroSMSNumberRetryInterval.Seconds()), attempt+1)
-		if IsHeroSMSNoNumbersError(err) {
-			step = fmt.Sprintf("当前 HeroSMS 模板暂无号码，%d 秒后继续用该模板获取（第 %d 次）", int(heroSMSNumberRetryInterval.Seconds()), attempt+1)
-		}
-		s.touch(sessionID, statusRunning, step, "", map[string]any{"error": err.Error(), "attempt": attempt, "template": template})
-		s.logUserRunForSession(sessionID, "info", fmt.Sprintf("%s；上次失败原因：%s", step, err.Error()))
+		step := fmt.Sprintf("所有启用 HeroSMS 模板本轮都暂无号码，%d 秒后继续轮询", int(heroSMSNumberRetryInterval.Seconds()))
+		s.touch(sessionID, statusRunning, step, "", map[string]any{"attempt": attempt, "templates": templates})
+		s.logUserRunForSession(sessionID, "info", step)
 		if s.sleepWithStop(ctx, sessionID, heroSMSNumberRetryInterval) {
 			s.touch(sessionID, statusStopped, "已停止获取手机号，可切换后重新开始", "", nil)
 			s.logUserRunForSession(sessionID, "warn", "已停止获取手机号")
@@ -1499,12 +2116,197 @@ func (s *Service) beginPhoneRegister(ctx context.Context, sessionID string) erro
 	return nil
 }
 
+func (s *Service) beginPhoneRegisterUntilCancel(ctx context.Context, sessionID, phone string, cancelAt time.Time) error {
+	attempt := 0
+	var lastErr error
+	for {
+		if s.isSessionStopped(sessionID) || ctx.Err() != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return context.Canceled
+		}
+		if !cancelAt.IsZero() && !time.Now().Before(cancelAt) {
+			if lastErr != nil {
+				return lastErr
+			}
+			return fmt.Errorf("手机号注册短信发送在取消时间前未完成")
+		}
+		attempt++
+		step := fmt.Sprintf("正在发送手机号 %s 注册短信（第 %d 次）", phone, attempt)
+		s.touch(sessionID, statusRunning, step, "", map[string]any{"phone": phone, "attempt": attempt})
+		s.logUserRunForSession(sessionID, "info", step)
+		err := s.beginPhoneRegister(ctx, sessionID)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isRetryableBeginPhoneRegisterError(err) {
+			return err
+		}
+		wait := time.Until(cancelAt)
+		if cancelAt.IsZero() || wait > heroSMSStatusPollInterval {
+			wait = heroSMSStatusPollInterval
+		}
+		if wait <= 0 {
+			return err
+		}
+		step = fmt.Sprintf("手机号 %s 注册短信发送失败，取消时间前继续重试（第 %d 次）", phone, attempt)
+		s.touch(sessionID, statusRunning, step, err.Error(), map[string]any{
+			"phone":         phone,
+			"attempt":       attempt,
+			"retry_seconds": int(wait.Seconds()),
+		})
+		s.logUserRunForSession(sessionID, "warn", step+"："+err.Error())
+		if s.sleepWithStop(ctx, sessionID, wait) {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return context.Canceled
+		}
+	}
+}
+
+func isRetryableBeginPhoneRegisterError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := err.Error()
+	nonRetryableMarkers := []string{
+		"手机号已被使用",
+		"phone_number_in_use",
+		"Phone number already in use",
+		"手机号不可用于全新注册",
+		"手机号注册未进入短信验证码步骤",
+		"手机号注册未进入设置密码步骤",
+		"手机号注册步骤不匹配",
+	}
+	for _, marker := range nonRetryableMarkers {
+		if strings.Contains(text, marker) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Service) shouldFastHandoffPhoneCode(sessionID string) bool {
+	session := s.getState(sessionID)
+	return session != nil && session.UserID > 0 && session.RunID != ""
+}
+
+func normalizeHeroSMSFastHandoffSeconds(seconds int) int {
+	if seconds <= 0 {
+		return defaultHeroSMSFastHandoffSeconds
+	}
+	if seconds < minHeroSMSFastHandoffSeconds {
+		return minHeroSMSFastHandoffSeconds
+	}
+	if seconds > maxHeroSMSFastHandoffSeconds {
+		return maxHeroSMSFastHandoffSeconds
+	}
+	return seconds
+}
+
+func heroSMSFastHandoffTimeout(seconds int) time.Duration {
+	return time.Duration(normalizeHeroSMSFastHandoffSeconds(seconds)) * time.Second
+}
+
+func (s *Service) heroSMSFastHandoffTimeout(sessionID string) time.Duration {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if session := s.sessions[sessionID]; session != nil && session.fastHandoffTimeout > 0 {
+		return session.fastHandoffTimeout
+	}
+	return heroSMSFastHandoffTimeout(0)
+}
+
+func (s *Service) finishWaitingHeroSMSActivation(parent context.Context, sessionID, apiKey, activationID, phone string, cancelAt time.Time, proxyURL string) {
+	timeout := time.Until(cancelAt) + 30*time.Second
+	if timeout < time.Minute {
+		timeout = time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	code, err := s.waitHeroSMSCodeWithTimeout(ctx, sessionID, apiKey, activationID, time.Until(cancelAt))
+	if err != nil {
+		s.logger.Warn("HeroSMS background wait failed", zap.String("activation_id", activationID), zap.String("phone", phone), zap.Error(err))
+	}
+	snapshot := s.publicSession(sessionID)
+	if parent.Err() != nil || s.isSessionStopped(sessionID) {
+		s.touch(sessionID, statusStopped, "已停止获取手机号，当前激活已请求取消", "", map[string]any{"activation_id": activationID, "phone": phone})
+		_ = s.cancelHeroSMSWithQueue(sessionID, apiKey, activationID, phone, "task_stopped", time.Now(), proxyURL)
+		s.closeAuthSession(sessionID)
+		if snapshot != nil && s.userPhoneTargetReached(snapshot.UserID, snapshot.RunID) {
+			s.releaseUserPhoneWaiting(snapshot.UserID, snapshot.RunID, snapshot, "目标数量已满足，后台等待手机号已取消")
+		} else {
+			s.settleWaitingPhoneFailure(sessionID, "手机号等待验证码期间任务已停止")
+		}
+		return
+	}
+	if snapshot != nil && s.userPhoneTargetReached(snapshot.UserID, snapshot.RunID) {
+		cancelData := s.cancelHeroSMSWithQueue(sessionID, apiKey, activationID, phone, "target_reached", time.Now(), proxyURL)
+		s.touch(sessionID, statusStopped, "目标数量已满足，后台等待手机号已取消", "", map[string]any{
+			"activation_id": activationID,
+			"phone":         phone,
+			"cancel_result": cancelData,
+		})
+		s.closeAuthSession(sessionID)
+		s.releaseUserPhoneWaiting(snapshot.UserID, snapshot.RunID, snapshot, "目标数量已满足，后台等待手机号已取消")
+		return
+	}
+	if code == "" {
+		cancelData := s.cancelHeroSMSWithQueue(sessionID, apiKey, activationID, phone, "phone_code_timeout", time.Now(), proxyURL)
+		s.touch(sessionID, statusFailed, "取消时间前仍未获取到手机号验证码，当前激活已取消", "", map[string]any{
+			"activation_id": activationID,
+			"phone":         phone,
+			"message":       "HeroSMS 取消时间前未返回验证码",
+			"cancel_result": cancelData,
+		})
+		s.logUserRunForSession(sessionID, "warn", fmt.Sprintf("手机号 %s 到取消时间仍未收到验证码，已取消当前激活", phone))
+		s.closeAuthSession(sessionID)
+		s.settleWaitingPhoneFailure(sessionID, "后台等待手机号验证码超时")
+		return
+	}
+	s.touch(sessionID, statusPhoneCodeSent, "后台已获取手机号验证码，正在自动确认", "", nil)
+	s.logUserRunForSession(sessionID, "info", fmt.Sprintf("手机号 %s 后台已获取验证码，正在自动确认", phone))
+	if err := s.verifyPhoneCode(ctx, sessionID, code); err != nil {
+		s.touch(sessionID, statusFailed, "后台确认手机号验证码失败", err.Error(), nil)
+		s.closeAuthSession(sessionID)
+		if snapshot := s.publicSession(sessionID); snapshot != nil && snapshot.UserID > 0 && snapshot.RunID != "" {
+			s.settleUserPhoneTerminalFailure(snapshot.UserID, snapshot.RunID, snapshot, "后台确认手机号验证码失败")
+		}
+		return
+	}
+	s.completeHeroSMS(apiKey, activationID, proxyURL)
+	snapshot = s.publicSession(sessionID)
+	if snapshot != nil && snapshot.Status == statusSuccess && snapshot.AccountID > 0 {
+		s.settleUserPhoneSuccess(snapshot.UserID, snapshot.RunID, snapshot)
+		return
+	}
+	if snapshot != nil {
+		if snapshot.UserID > 0 && snapshot.RunID != "" {
+			s.settleUserPhoneTerminalFailure(snapshot.UserID, snapshot.RunID, snapshot, firstString(snapshot.Step, "后台手机号注册失败"))
+			return
+		}
+		s.settleWaitingPhoneFailure(sessionID, firstString(snapshot.Step, "后台手机号注册失败"))
+	}
+}
+
+func (s *Service) settleWaitingPhoneFailure(sessionID, step string) {
+	snapshot := s.publicSession(sessionID)
+	if snapshot == nil || snapshot.UserID <= 0 || snapshot.RunID == "" {
+		return
+	}
+	s.settleUserPhoneFailure(snapshot.UserID, snapshot.RunID, snapshot, step)
+}
+
 func (s *Service) verifyPhoneCode(ctx context.Context, sessionID, code string) error {
 	session := s.getState(sessionID)
 	if session == nil {
 		return fmt.Errorf("手机号注册会话不存在: %s", sessionID)
 	}
-	if session.Status != statusPhoneCodeSent {
+	if session.Status != statusPhoneCodeSent && session.Status != statusWaitingPhoneCode {
 		return fmt.Errorf("当前状态为 %s，不能确认手机号验证码", session.Status)
 	}
 	code = strings.TrimSpace(code)
@@ -2159,17 +2961,34 @@ func (s *Service) exchangeCallbackForToken(ctx context.Context, sessionID, callb
 }
 
 func (s *Service) waitHeroSMSCode(ctx context.Context, sessionID string, apiKey string, activationID string) (string, error) {
-	deadline := time.Now().Add(heroSMSStatusTimeout)
+	return s.waitHeroSMSCodeWithTimeout(ctx, sessionID, apiKey, activationID, heroSMSStatusTimeout)
+}
+
+func (s *Service) waitHeroSMSCodeWithTimeout(ctx context.Context, sessionID string, apiKey string, activationID string, timeout time.Duration) (string, error) {
+	if timeout <= 0 {
+		s.updatePhoneCodeProgress(sessionID, 0, 0)
+		return "", nil
+	}
+	maxAttempts := int((timeout + heroSMSStatusPollInterval - time.Nanosecond) / heroSMSStatusPollInterval)
+	deadline := time.Now().Add(timeout)
 	pollIndex := 0
 	resendCount := 0
 	var lastStatus map[string]any
+	var lastErr error
 	session := s.getState(sessionID)
 	smsProxy := ""
 	if session != nil {
 		smsProxy = session.proxy.forSMS()
 	}
-	for pollIndex < heroSMSStatusMaxAttempts {
-		if s.sleepWithStop(ctx, sessionID, heroSMSStatusPollInterval) {
+	for pollIndex < maxAttempts {
+		wait := time.Until(deadline)
+		if wait <= 0 {
+			break
+		}
+		if wait > heroSMSStatusPollInterval {
+			wait = heroSMSStatusPollInterval
+		}
+		if s.sleepWithStop(ctx, sessionID, wait) {
 			s.touch(sessionID, statusRunning, "已请求停止等待 HeroSMS 短信验证码", "", nil)
 			return "", nil
 		}
@@ -2178,12 +2997,22 @@ func (s *Service) waitHeroSMSCode(ctx context.Context, sessionID string, apiKey 
 		if remaining < 0 {
 			remaining = 0
 		}
-		s.updatePhoneCodeProgress(sessionID, pollIndex, heroSMSStatusMaxAttempts)
+		s.updatePhoneCodeProgress(sessionID, pollIndex, maxAttempts)
 		s.touch(sessionID, statusRunning, fmt.Sprintf("等待 HeroSMS 短信验证码（第 %d 次，剩余 %d 秒）", pollIndex, remaining), "", nil)
 		statusData, err := s.heroSMS.GetStatus(ctx, apiKey, activationID, smsProxy)
 		if err != nil {
-			return "", err
+			lastErr = err
+			step := fmt.Sprintf("获取 HeroSMS 短信状态失败，继续重试直到取消时间（第 %d 次）", pollIndex)
+			s.touch(sessionID, statusRunning, step, err.Error(), map[string]any{
+				"activation_id": activationID,
+				"attempt":       pollIndex,
+				"max_attempts":  maxAttempts,
+				"remaining":     remaining,
+			})
+			s.logUserRunForSession(sessionID, "warn", step+"："+err.Error())
+			continue
 		}
+		lastErr = nil
 		lastStatus = statusData
 		s.setLastHeroSMSStatus(sessionID, statusData)
 		s.touch(sessionID, statusRunning, "", "", statusData)
@@ -2207,7 +3036,13 @@ func (s *Service) waitHeroSMSCode(ctx context.Context, sessionID string, apiKey 
 			}
 		}
 	}
-	s.updatePhoneCodeProgress(sessionID, heroSMSStatusMaxAttempts, heroSMSStatusMaxAttempts)
+	s.updatePhoneCodeProgress(sessionID, maxAttempts, maxAttempts)
+	if lastErr != nil {
+		if lastStatus == nil {
+			lastStatus = map[string]any{}
+		}
+		lastStatus["error"] = lastErr.Error()
+	}
 	s.touch(sessionID, statusRunning, "", "", lastStatus)
 	return "", nil
 }
@@ -2262,7 +3097,7 @@ func (s *Service) markUserEmailBound(ctx context.Context, session *sessionState)
 	s.logUserRunForSession(session.ID, "info", fmt.Sprintf("邮箱已绑定账号，已标记 user_email 为已用: %s", session.Email))
 }
 
-func (s *Service) assignUnusedUserEmail(ctx context.Context, sessionID string, userID int64) (*UserEmail, error) {
+func (s *Service) assignUnusedUserEmail(ctx context.Context, sessionID string, userID, accountID int64) (*UserEmail, error) {
 	session := s.getState(sessionID)
 	if session == nil {
 		return nil, fmt.Errorf("手机号注册会话不存在: %s", sessionID)
@@ -2270,8 +3105,14 @@ func (s *Service) assignUnusedUserEmail(ctx context.Context, sessionID string, u
 	if strings.TrimSpace(session.Email) != "" && session.UserEmailID > 0 {
 		return &UserEmail{ID: session.UserEmailID, UserID: userID, Email: session.Email}, nil
 	}
+	if accountID <= 0 {
+		accountID = session.AccountID
+	}
+	if accountID <= 0 {
+		return nil, fmt.Errorf("账号 ID 无效，无法预占邮箱")
+	}
 	excludes := s.reservedUserEmails(userID, sessionID)
-	email, err := s.repo.ClaimUnusedUserEmail(ctx, userID, excludes)
+	email, err := s.repo.ReserveUnusedUserEmail(ctx, userID, accountID, excludes)
 	if err != nil {
 		return nil, err
 	}
@@ -2282,6 +3123,7 @@ func (s *Service) assignUnusedUserEmail(ctx context.Context, sessionID string, u
 	if current := s.sessions[sessionID]; current != nil {
 		current.UserEmailID = email.ID
 		current.Email = email.Email
+		current.AccountID = accountID
 		current.Step = fmt.Sprintf("已分配用户邮箱: %s", email.Email)
 		current.UpdatedAt = time.Now()
 	}
@@ -2446,8 +3288,21 @@ func (s *Service) touch(sessionID string, status string, step string, errText st
 	}
 	if step != "" {
 		session.Step = step
+		level := "info"
+		if status == statusFailed || errText != "" {
+			level = "error"
+		} else if status == statusStopped || status == statusWaitingPhoneCode {
+			level = "warn"
+		} else if status == statusSuccess {
+			level = "ok"
+		}
+		session.logs = appendCappedSessionLog(session.logs, UserRunLog{
+			Time:    time.Now(),
+			Level:   level,
+			Message: step,
+		})
 	}
-	if errText != "" || status == statusRunning || status == statusSuccess || status == statusStopped || status == statusFailed || status == statusCodexEmailRequired {
+	if errText != "" || status == statusRunning || status == statusWaitingPhoneCode || status == statusSuccess || status == statusStopped || status == statusFailed || status == statusCodexEmailRequired {
 		session.Error = errText
 	}
 	if raw != nil {
@@ -2543,6 +3398,69 @@ func (s *Service) publicUserRun(userID int64) *UserRun {
 		return nil
 	}
 	return cloneUserRun(&run.UserRun)
+}
+
+func (s *Service) publicPhoneQueue(userID int64) []PhoneQueueItem {
+	s.userMu.RLock()
+	run := s.userRuns[userID]
+	runID := ""
+	if run != nil {
+		runID = run.ID
+	}
+	s.userMu.RUnlock()
+	if runID == "" {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := []PhoneQueueItem{}
+	for _, session := range s.sessions {
+		if session == nil || session.UserID != userID || session.RunID != runID {
+			continue
+		}
+		out = append(out, PhoneQueueItem{
+			SessionID:    session.ID,
+			Phone:        session.Phone,
+			ActivationID: session.HeroSMSActivationID,
+			Status:       session.Status,
+			Step:         session.Step,
+			Error:        session.Error,
+			AccountID:    session.AccountID,
+			CreatedAt:    session.CreatedAt,
+			UpdatedAt:    session.UpdatedAt,
+			Logs:         append([]UserRunLog(nil), session.logs...),
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out
+}
+
+func (s *Service) publicPhoneCancelQueue(userID int64) []PhoneCancelQueueItem {
+	s.userMu.RLock()
+	run := s.userRuns[userID]
+	runID := ""
+	if run != nil {
+		runID = run.ID
+	}
+	s.userMu.RUnlock()
+	if runID == "" {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := []PhoneCancelQueueItem{}
+	for _, item := range s.cancels {
+		if item == nil || item.UserID != userID || item.RunID != runID {
+			continue
+		}
+		out = append(out, *item)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out
 }
 
 func (s *Service) publicUserEmailRun(userID int64) *UserEmailRun {
@@ -2736,16 +3654,23 @@ func (s *Service) logUserRunForSession(sessionID, level, message string) {
 	if strings.TrimSpace(message) == "" {
 		return
 	}
+	item := UserRunLog{
+		Time:    time.Now(),
+		Level:   level,
+		Message: message,
+	}
+	s.mu.Lock()
+	if session := s.sessions[sessionID]; session != nil {
+		session.logs = appendCappedSessionLog(session.logs, item)
+		session.UpdatedAt = time.Now()
+	}
+	s.mu.Unlock()
 	session := s.publicSession(sessionID)
 	if session == nil || session.UserID <= 0 || session.RunID == "" {
 		return
 	}
 	s.updateUserRun(session.UserID, session.RunID, func(run *userRunState) {
-		run.Logs = appendCappedRunLog(run.Logs, UserRunLog{
-			Time:    time.Now(),
-			Level:   level,
-			Message: message,
-		})
+		run.Logs = appendCappedRunLog(run.Logs, item)
 		if message != "" {
 			run.Step = message
 		}
@@ -2786,6 +3711,11 @@ func (s *Service) maybeFinishUserRun(userID int64, runID string) {
 	defer s.userMu.Unlock()
 	run := s.userRuns[userID]
 	if run == nil || run.ID != runID || !isActiveUserRunStatus(run.Status) {
+		return
+	}
+	if run.PhoneWaitingCount > 0 {
+		run.Step = fmt.Sprintf("等待后台手机号验证码：%d 个手机号仍在取消时间前重试", run.PhoneWaitingCount)
+		run.UpdatedAt = time.Now()
 		return
 	}
 	if !run.PhoneDone {
@@ -2836,8 +3766,29 @@ func appendCappedRunLog(logs []UserRunLog, item UserRunLog) []UserRunLog {
 	return logs
 }
 
+func appendCappedSessionLog(logs []UserRunLog, item UserRunLog) []UserRunLog {
+	if item.Time.IsZero() {
+		item.Time = time.Now()
+	}
+	if item.Level == "" {
+		item.Level = "info"
+	}
+	if len(logs) > 0 {
+		last := logs[len(logs)-1]
+		if last.Message == item.Message && last.Level == item.Level && time.Since(last.Time) < 2*time.Second {
+			return logs
+		}
+	}
+	logs = append(logs, item)
+	const maxSessionLogs = 30
+	if len(logs) > maxSessionLogs {
+		return append([]UserRunLog(nil), logs[len(logs)-maxSessionLogs:]...)
+	}
+	return logs
+}
+
 func isActiveUserRunStatus(status string) bool {
-	return status == statusRunning || status == statusPhoneCodeSent || status == statusCodexEmailRequired || status == statusEmailCodeSent
+	return status == statusRunning || status == statusWaitingPhoneCode || status == statusPhoneCodeSent || status == statusCodexEmailRequired || status == statusEmailCodeSent
 }
 
 func cloneSession(in *Session) *Session {
@@ -2914,8 +3865,157 @@ func (s *Service) cancelHeroSMS(apiKey, activationID, proxyURL string) map[strin
 	return data
 }
 
+func (s *Service) cancelHeroSMSWithQueue(sessionID, apiKey, activationID, phone, reason string, cancelAt time.Time, proxyURL string) map[string]any {
+	s.markHeroSMSCancelQueue(sessionID, activationID, phone, reason, cancelAt)
+	data := s.cancelHeroSMS(apiKey, activationID, proxyURL)
+	if strings.TrimSpace(stringValue(data["error"])) != "" {
+		s.finishHeroSMSCancelQueue(sessionID, activationID, "error")
+	} else {
+		s.finishHeroSMSCancelQueue(sessionID, activationID, "done")
+	}
+	return data
+}
+
+func (s *Service) waitAndCancelHeroSMS(ctx context.Context, sessionID, apiKey, activationID, phone, reason string, cancelAt time.Time, proxyURL string) map[string]any {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "cancel_delay_elapsed"
+	}
+	wait, cancelAt := heroSMSCancelWait(cancelAt)
+	s.markHeroSMSCancelQueue(sessionID, activationID, phone, reason, cancelAt)
+	step := fmt.Sprintf("手机号 %s 当前激活将在 %d 秒后取消，期间继续等待用户停止或取消时间到达", phone, int(wait.Seconds()))
+	s.touch(sessionID, statusRunning, step, "", map[string]any{
+		"activation_id": activationID,
+		"phone":         phone,
+		"reason":        reason,
+		"cancel_at":     cancelAt.Format(time.RFC3339),
+		"delay_seconds": int(wait.Seconds()),
+	})
+	if wait > 0 && s.sleepWithStop(ctx, sessionID, wait) {
+		s.finishHeroSMSCancelQueue(sessionID, activationID, "stopped")
+		return map[string]any{
+			"queued":        false,
+			"activation_id": activationID,
+			"phone":         phone,
+			"reason":        reason,
+			"stopped":       true,
+		}
+	}
+	data := s.cancelHeroSMS(apiKey, activationID, proxyURL)
+	if strings.TrimSpace(stringValue(data["error"])) != "" {
+		s.finishHeroSMSCancelQueue(sessionID, activationID, "error")
+	} else {
+		s.finishHeroSMSCancelQueue(sessionID, activationID, "done")
+	}
+	return data
+}
+
+func heroSMSCancelWait(cancelAt time.Time) (time.Duration, time.Time) {
+	wait := time.Until(cancelAt)
+	if cancelAt.IsZero() || wait > heroSMSCancelDelay {
+		wait = heroSMSCancelDelay
+		cancelAt = time.Now().Add(wait)
+	}
+	if wait < 0 {
+		wait = 0
+	}
+	return wait, cancelAt
+}
+
+func (s *Service) scheduleHeroSMSCancelAt(parent context.Context, sessionID, apiKey, activationID, phone, reason string, cancelAt time.Time, proxyURL string) {
+	wait, cancelAt := heroSMSCancelWait(cancelAt)
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "cancel_delay_elapsed"
+	}
+	go func() {
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-parent.Done():
+		}
+		result := s.cancelHeroSMS(apiKey, activationID, proxyURL)
+		if errText := strings.TrimSpace(stringValue(result["error"])); errText != "" {
+			s.finishHeroSMSCancelQueue(sessionID, activationID, "error")
+			s.logger.Warn("HeroSMS background cancel failed",
+				zap.String("activation_id", activationID),
+				zap.String("phone", phone),
+				zap.String("reason", reason),
+				zap.String("cancel_at", cancelAt.Format(time.RFC3339)),
+				zap.String("error", errText),
+			)
+			return
+		}
+		s.finishHeroSMSCancelQueue(sessionID, activationID, "done")
+		s.logger.Info("HeroSMS background canceled activation",
+			zap.String("activation_id", activationID),
+			zap.String("phone", phone),
+			zap.String("reason", reason),
+			zap.String("cancel_at", cancelAt.Format(time.RFC3339)),
+		)
+	}()
+}
+
+func (s *Service) markHeroSMSCancelQueue(sessionID, activationID, phone, reason string, cancelAt time.Time) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "cancel_delay_elapsed"
+	}
+	activationID = strings.TrimSpace(activationID)
+	if activationID == "" {
+		return
+	}
+	phone = strings.TrimSpace(phone)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if session := s.sessions[sessionID]; session != nil {
+		key := session.ID + ":" + activationID
+		item := s.cancels[key]
+		if item == nil {
+			item = &PhoneCancelQueueItem{
+				SessionID:    session.ID,
+				UserID:       session.UserID,
+				RunID:        session.RunID,
+				Phone:        firstString(phone, session.Phone),
+				ActivationID: activationID,
+				CreatedAt:    time.Now(),
+			}
+			s.cancels[key] = item
+		}
+		item.Phone = firstString(phone, item.Phone, session.Phone)
+		item.Reason = reason
+		item.Status = "waiting"
+		item.CancelAt = cancelAt
+		item.CanceledAt = time.Time{}
+		item.UpdatedAt = time.Now()
+		session.UpdatedAt = time.Now()
+	}
+}
+
+func (s *Service) finishHeroSMSCancelQueue(sessionID, activationID, status string) {
+	status = strings.TrimSpace(status)
+	if status == "" {
+		status = "done"
+	}
+	activationID = strings.TrimSpace(activationID)
+	if activationID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := sessionID + ":" + activationID
+	if item := s.cancels[key]; item != nil {
+		item.Status = status
+		item.CanceledAt = time.Now()
+		item.UpdatedAt = time.Now()
+	}
+	if session := s.sessions[sessionID]; session != nil {
+		session.UpdatedAt = time.Now()
+	}
+}
+
 func (s *Service) completeHeroSMS(apiKey, activationID, proxyURL string) {
-	s.removeHeroSMSCancel(apiKey, activationID)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if _, err := s.heroSMS.SetStatus(ctx, apiKey, activationID, 6, proxyURL); err != nil {
@@ -2945,210 +4045,6 @@ func isRetryablePhoneAttemptError(err error) bool {
 		}
 	}
 	return false
-}
-
-func (s *Service) queueHeroSMSCancel(apiKey, activationID, phone, reason string, delay time.Duration, proxyURL string) map[string]any {
-	apiKey = strings.TrimSpace(apiKey)
-	activationID = strings.TrimSpace(activationID)
-	phone = strings.TrimSpace(phone)
-	reason = strings.TrimSpace(reason)
-	proxyURL = strings.TrimSpace(proxyURL)
-	if apiKey == "" || activationID == "" {
-		return map[string]any{
-			"queued":            false,
-			"activation_id":     activationID,
-			"phone":             phone,
-			"activation_status": 8,
-			"error":             "HeroSMS api_key 或激活 ID 为空，无法加入取消队列",
-		}
-	}
-	if delay < 0 {
-		delay = 0
-	}
-	taskKey := heroSMSCancelTaskKey(apiKey, activationID)
-	cancelAfter := time.Now().Add(delay)
-	createdAt := time.Now()
-
-	s.cancelMu.Lock()
-	if existing := s.cancelTasks[taskKey]; existing != nil {
-		existing.apiKey = apiKey
-		if phone != "" {
-			existing.phone = phone
-		}
-		if reason != "" {
-			existing.reason = reason
-		}
-		existing.proxyURL = proxyURL
-		if existing.cancelAfter.Before(cancelAfter) {
-			existing.cancelAfter = cancelAfter
-		}
-	} else {
-		s.cancelTasks[taskKey] = &heroSMSCancelTask{
-			key:          taskKey,
-			apiKey:       apiKey,
-			activationID: activationID,
-			phone:        phone,
-			reason:       reason,
-			proxyURL:     proxyURL,
-			createdAt:    createdAt,
-			cancelAfter:  cancelAfter,
-		}
-	}
-	s.cancelMu.Unlock()
-
-	s.cancelOnce.Do(func() {
-		go s.runHeroSMSCancelWorker()
-	})
-	s.notifyHeroSMSCancelWorker()
-
-	s.logger.Info(
-		"HeroSMS activation queued for cancel",
-		zap.String("activation_id", activationID),
-		zap.String("phone", phone),
-		zap.String("reason", reason),
-		zap.Duration("delay", delay),
-	)
-	return map[string]any{
-		"queued":            true,
-		"activation_id":     activationID,
-		"phone":             phone,
-		"activation_status": 8,
-		"cancel_after":      cancelAfter.Format(time.RFC3339),
-		"delay_seconds":     int(delay.Seconds()),
-		"reason":            reason,
-	}
-}
-
-func (s *Service) notifyHeroSMSCancelWorker() {
-	select {
-	case s.cancelNotify <- struct{}{}:
-	default:
-	}
-}
-
-func (s *Service) runHeroSMSCancelWorker() {
-	for {
-		task, wait := s.nextHeroSMSCancelTask()
-		if task == nil {
-			<-s.cancelNotify
-			continue
-		}
-		if wait > 0 {
-			timer := time.NewTimer(wait)
-			select {
-			case <-timer.C:
-			case <-s.cancelNotify:
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-				continue
-			}
-		}
-		task, ok := s.popDueHeroSMSCancelTask(task.key)
-		if !ok {
-			continue
-		}
-		result := s.cancelHeroSMS(task.apiKey, task.activationID, task.proxyURL)
-		if errText := strings.TrimSpace(stringValue(result["error"])); errText != "" {
-			statusCode := int(int64Value(result["status_code"]))
-			retryable := boolValue(result["retryable"])
-			if !retryable || task.attempts >= heroSMSCancelMaxRetries {
-				s.logger.Warn(
-					"HeroSMS queued cancel failed, treated as done",
-					zap.String("activation_id", task.activationID),
-					zap.String("phone", task.phone),
-					zap.Int("status_code", statusCode),
-					zap.Bool("retryable", retryable),
-					zap.Int("attempts", task.attempts),
-					zap.String("error", errText),
-				)
-				continue
-			}
-			task.attempts++
-			task.lastError = errText
-			task.cancelAfter = time.Now().Add(heroSMSCancelRetryInterval)
-			s.requeueHeroSMSCancelTask(task)
-			s.logger.Warn(
-				"HeroSMS queued cancel failed, requeued",
-				zap.String("activation_id", task.activationID),
-				zap.String("phone", task.phone),
-				zap.Int("attempts", task.attempts),
-				zap.String("error", errText),
-			)
-			continue
-		}
-		s.logger.Info(
-			"HeroSMS queued cancel done",
-			zap.String("activation_id", task.activationID),
-			zap.String("phone", task.phone),
-			zap.String("reason", task.reason),
-		)
-	}
-}
-
-func (s *Service) nextHeroSMSCancelTask() (*heroSMSCancelTask, time.Duration) {
-	s.cancelMu.Lock()
-	defer s.cancelMu.Unlock()
-	if len(s.cancelTasks) == 0 {
-		return nil, 0
-	}
-	var chosen *heroSMSCancelTask
-	for _, task := range s.cancelTasks {
-		if chosen == nil || task.cancelAfter.Before(chosen.cancelAfter) {
-			chosen = task
-		}
-	}
-	if chosen == nil {
-		return nil, 0
-	}
-	out := *chosen
-	wait := time.Until(out.cancelAfter)
-	if wait < 0 {
-		wait = 0
-	}
-	return &out, wait
-}
-
-func (s *Service) popDueHeroSMSCancelTask(taskKey string) (*heroSMSCancelTask, bool) {
-	s.cancelMu.Lock()
-	defer s.cancelMu.Unlock()
-	task := s.cancelTasks[taskKey]
-	if task == nil || time.Now().Before(task.cancelAfter) {
-		return nil, false
-	}
-	delete(s.cancelTasks, taskKey)
-	out := *task
-	return &out, true
-}
-
-func (s *Service) requeueHeroSMSCancelTask(task *heroSMSCancelTask) {
-	if task == nil {
-		return
-	}
-	s.cancelMu.Lock()
-	s.cancelTasks[task.key] = task
-	s.cancelMu.Unlock()
-	s.notifyHeroSMSCancelWorker()
-}
-
-func (s *Service) removeHeroSMSCancel(apiKey, activationID string) {
-	apiKey = strings.TrimSpace(apiKey)
-	activationID = strings.TrimSpace(activationID)
-	if apiKey == "" || activationID == "" {
-		return
-	}
-	taskKey := heroSMSCancelTaskKey(apiKey, activationID)
-	s.cancelMu.Lock()
-	delete(s.cancelTasks, taskKey)
-	s.cancelMu.Unlock()
-	s.notifyHeroSMSCancelWorker()
-}
-
-func heroSMSCancelTaskKey(apiKey, activationID string) string {
-	return strings.TrimSpace(apiKey) + "\x00" + strings.TrimSpace(activationID)
 }
 
 func isRetryableHeroSMSCancelError(err error) bool {
@@ -3182,6 +4078,7 @@ func isPhoneNumberInUseResponse(data map[string]any, err error) bool {
 
 func isTerminalOrWaitingStatus(status string) bool {
 	return status == statusSuccess ||
+		status == statusWaitingPhoneCode ||
 		status == statusCodexEmailRequired ||
 		status == statusEmailCodeSent ||
 		status == statusRegistrationBlocked

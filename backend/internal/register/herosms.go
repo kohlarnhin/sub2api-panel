@@ -56,23 +56,43 @@ func DefaultTemplate() HeroSMSTemplate {
 	}
 }
 
-func (c *HeroSMSClient) GetNumber(ctx context.Context, apiKey string, template HeroSMSTemplate, proxyURL string) (map[string]any, error) {
-	apiKey = strings.TrimSpace(apiKey)
-	if apiKey == "" {
-		return nil, fmt.Errorf("HeroSMS api_key 不能为空")
+func normalizeHeroSMSTemplate(template HeroSMSTemplate) HeroSMSTemplate {
+	template.Name = strings.TrimSpace(template.Name)
+	if template.Name == "" {
+		template.Name = DefaultHeroSMSTemplateName
+	}
+	template.Service = strings.TrimSpace(template.Service)
+	if template.Service == "" {
+		template.Service = DefaultHeroSMSService
 	}
 	if template.Country <= 0 {
 		template.Country = DefaultHeroSMSCountry
 	}
-	if template.Service == "" {
-		template.Service = DefaultHeroSMSService
-	}
+	template.Operator = strings.TrimSpace(template.Operator)
 	if template.Operator == "" {
 		template.Operator = DefaultHeroSMSOperator
 	}
 	if template.MaxPrice <= 0 {
 		template.MaxPrice = DefaultHeroSMSMaxPrice
 	}
+	if template.Owner <= 0 {
+		template.Owner = DefaultHeroSMSOwner
+	}
+	if template.ActivationType < 0 {
+		template.ActivationType = DefaultHeroSMSActivation
+	}
+	if template.Amount <= 0 {
+		template.Amount = DefaultHeroSMSAmount
+	}
+	return template
+}
+
+func (c *HeroSMSClient) GetNumber(ctx context.Context, apiKey string, template HeroSMSTemplate, proxyURL string) (map[string]any, error) {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return nil, fmt.Errorf("HeroSMS api_key 不能为空")
+	}
+	template = normalizeHeroSMSTemplate(template)
 
 	params := url.Values{}
 	params.Set("action", "getNumberV2")

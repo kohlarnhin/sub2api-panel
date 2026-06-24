@@ -6,7 +6,7 @@ const (
 	DefaultHeroSMSService       = "dr"
 	DefaultHeroSMSCountry       = 151
 	DefaultHeroSMSOperator      = "any"
-	DefaultHeroSMSMaxPrice      = 0.03
+	DefaultHeroSMSMaxPrice      = 0.04
 	DefaultHeroSMSOwner         = 6
 	DefaultHeroSMSActivation    = 0
 	DefaultHeroSMSAmount        = 1
@@ -63,6 +63,13 @@ type UserSub2APIUploadRequest struct {
 	PageConfig    *UserPageConfig      `json:"page_config,omitempty"`
 }
 
+type UserAccountRetryLoginRequest struct {
+	UserID        int64                `json:"user_id" binding:"required"`
+	AccountID     int64                `json:"account_id" binding:"required"`
+	CustomSub2API *CustomSub2APIConfig `json:"custom_sub2api,omitempty"`
+	PageConfig    *UserPageConfig      `json:"page_config,omitempty"`
+}
+
 type UserRegisterStartRequest struct {
 	UserID        int64                `json:"user_id" binding:"required"`
 	APIKey        string               `json:"api_key" binding:"required"`
@@ -85,17 +92,20 @@ type UserPageConfigRequest struct {
 }
 
 type UserPageConfig struct {
-	HeroSMSAPIKey       string              `json:"herosms_api_key"`
-	DuckAuthorization   string              `json:"duck_authorization"`
-	RegisterCount       int                 `json:"register_count"`
-	EmailCount          int                 `json:"email_count"`
-	GlobalProxy         string              `json:"global_proxy"`
-	ProxySMSEnabled     bool                `json:"proxy_sms_enabled"`
-	ProxyOpenAIEnabled  bool                `json:"proxy_openai_enabled"`
-	ProxyEmailEnabled   bool                `json:"proxy_email_enabled"`
-	ProxySub2APIEnabled bool                `json:"proxy_sub2api_enabled"`
-	CustomSub2API       CustomSub2APIConfig `json:"custom_sub2api"`
-	UpdatedAt           time.Time           `json:"updated_at"`
+	HeroSMSAPIKey             string              `json:"herosms_api_key"`
+	HeroSMSTemplate           HeroSMSTemplate     `json:"herosms_template"`
+	HeroSMSTemplates          []HeroSMSTemplate   `json:"herosms_templates"`
+	HeroSMSFastHandoffSeconds int                 `json:"herosms_fast_handoff_seconds"`
+	DuckAuthorization         string              `json:"duck_authorization"`
+	RegisterCount             int                 `json:"register_count"`
+	EmailCount                int                 `json:"email_count"`
+	GlobalProxy               string              `json:"global_proxy"`
+	ProxySMSEnabled           bool                `json:"proxy_sms_enabled"`
+	ProxyOpenAIEnabled        bool                `json:"proxy_openai_enabled"`
+	ProxyEmailEnabled         bool                `json:"proxy_email_enabled"`
+	ProxySub2APIEnabled       bool                `json:"proxy_sub2api_enabled"`
+	CustomSub2API             CustomSub2APIConfig `json:"custom_sub2api"`
+	UpdatedAt                 time.Time           `json:"updated_at"`
 }
 
 type StopRequest struct {
@@ -130,6 +140,7 @@ type Session struct {
 	HeroSMSAttempt       int                    `json:"hero_sms_attempt"`
 	HeroSMSAttempts      []HeroSMSAttempt       `json:"hero_sms_attempts"`
 	Template             HeroSMSTemplate        `json:"template"`
+	Templates            []HeroSMSTemplate      `json:"templates,omitempty"`
 	GroupIDs             []int64                `json:"group_ids"`
 	StopRequested        bool                   `json:"stop_requested"`
 	CreatedAt            time.Time              `json:"created_at"`
@@ -226,15 +237,18 @@ type UserEmailListResponse struct {
 }
 
 type UserAccount struct {
-	ID        int64     `json:"id"`
-	UserID    int64     `json:"user_id"`
-	Phone     string    `json:"phone"`
-	Email     string    `json:"email"`
-	Password  string    `json:"password"`
-	Status    string    `json:"status"`
-	Error     string    `json:"error"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID          int64     `json:"id"`
+	UserID      int64     `json:"user_id"`
+	UserEmailID int64     `json:"user_email_id,omitempty"`
+	Phone       string    `json:"phone"`
+	Email       string    `json:"email"`
+	Password    string    `json:"password"`
+	Name        string    `json:"name,omitempty"`
+	Birthdate   string    `json:"birthdate,omitempty"`
+	Status      string    `json:"status"`
+	Error       string    `json:"error"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 type UserAccountSub2APIUploadTarget struct {
@@ -281,6 +295,7 @@ type UserRun struct {
 	Step                  string       `json:"step"`
 	Error                 string       `json:"error"`
 	PhoneSuccessCount     int          `json:"phone_success_count"`
+	PhoneWaitingCount     int          `json:"phone_waiting_count"`
 	PhoneFailureCount     int          `json:"phone_failure_count"`
 	LoginQueuedCount      int          `json:"login_queued_count"`
 	LoginStartedCount     int          `json:"login_started_count"`
@@ -301,14 +316,43 @@ type UserRun struct {
 	UpdatedAt             time.Time    `json:"updated_at"`
 }
 
+type PhoneQueueItem struct {
+	SessionID    string       `json:"session_id"`
+	Phone        string       `json:"phone"`
+	ActivationID string       `json:"activation_id"`
+	Status       string       `json:"status"`
+	Step         string       `json:"step"`
+	Error        string       `json:"error"`
+	AccountID    int64        `json:"account_id,omitempty"`
+	CreatedAt    time.Time    `json:"created_at"`
+	UpdatedAt    time.Time    `json:"updated_at"`
+	Logs         []UserRunLog `json:"logs"`
+}
+
+type PhoneCancelQueueItem struct {
+	SessionID    string    `json:"session_id"`
+	UserID       int64     `json:"user_id"`
+	RunID        string    `json:"run_id"`
+	Phone        string    `json:"phone"`
+	ActivationID string    `json:"activation_id"`
+	Status       string    `json:"status"`
+	Reason       string    `json:"reason"`
+	CancelAt     time.Time `json:"cancel_at"`
+	CanceledAt   time.Time `json:"canceled_at,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
 type UserDashboard struct {
-	User           RegisterUser   `json:"user"`
-	PageConfig     UserPageConfig `json:"page_config"`
-	Summary        UserSummary    `json:"summary"`
-	LoginSummary   LoginSummary   `json:"login_summary"`
-	Run            *UserRun       `json:"run,omitempty"`
-	EmailRun       *UserEmailRun  `json:"email_run,omitempty"`
-	LatestAccounts []UserAccount  `json:"latest_accounts"`
+	User             RegisterUser           `json:"user"`
+	PageConfig       UserPageConfig         `json:"page_config"`
+	Summary          UserSummary            `json:"summary"`
+	LoginSummary     LoginSummary           `json:"login_summary"`
+	Run              *UserRun               `json:"run,omitempty"`
+	PhoneQueue       []PhoneQueueItem       `json:"phone_queue"`
+	PhoneCancelQueue []PhoneCancelQueueItem `json:"phone_cancel_queue"`
+	EmailRun         *UserEmailRun          `json:"email_run,omitempty"`
+	LatestAccounts   []UserAccount          `json:"latest_accounts"`
 }
 
 type UserEmailGenerateResult struct {

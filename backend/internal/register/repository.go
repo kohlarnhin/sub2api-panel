@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -75,6 +76,16 @@ func (r *Repository) EnsureSchema(ctx context.Context) error {
 		CREATE TABLE IF NOT EXISTS register_user_page_config (
 			user_id BIGINT PRIMARY KEY REFERENCES register_users(id) ON DELETE CASCADE,
 			herosms_api_key TEXT NOT NULL DEFAULT '',
+			herosms_template_name TEXT NOT NULL DEFAULT '智利',
+			herosms_service TEXT NOT NULL DEFAULT 'dr',
+			herosms_country INT NOT NULL DEFAULT 151,
+			herosms_operator TEXT NOT NULL DEFAULT 'any',
+			herosms_max_price DOUBLE PRECISION NOT NULL DEFAULT 0.04,
+			herosms_owner INT NOT NULL DEFAULT 6,
+			herosms_activation INT NOT NULL DEFAULT 0,
+			herosms_amount INT NOT NULL DEFAULT 1,
+			herosms_templates TEXT NOT NULL DEFAULT '[]',
+			herosms_fast_handoff_seconds INT NOT NULL DEFAULT 60,
 			duck_authorization TEXT NOT NULL DEFAULT '',
 			register_count INT NOT NULL DEFAULT 1,
 			email_count INT NOT NULL DEFAULT 1,
@@ -93,6 +104,16 @@ func (r *Repository) EnsureSchema(ctx context.Context) error {
 		)
 		`,
 		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS herosms_api_key TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS herosms_template_name TEXT NOT NULL DEFAULT '智利'`,
+		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS herosms_service TEXT NOT NULL DEFAULT 'dr'`,
+		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS herosms_country INT NOT NULL DEFAULT 151`,
+		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS herosms_operator TEXT NOT NULL DEFAULT 'any'`,
+		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS herosms_max_price DOUBLE PRECISION NOT NULL DEFAULT 0.04`,
+		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS herosms_owner INT NOT NULL DEFAULT 6`,
+		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS herosms_activation INT NOT NULL DEFAULT 0`,
+		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS herosms_amount INT NOT NULL DEFAULT 1`,
+		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS herosms_templates TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS herosms_fast_handoff_seconds INT NOT NULL DEFAULT 60`,
 		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS duck_authorization TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS register_count INT NOT NULL DEFAULT 1`,
 		`ALTER TABLE register_user_page_config ADD COLUMN IF NOT EXISTS email_count INT NOT NULL DEFAULT 1`,
@@ -167,6 +188,16 @@ func (r *Repository) GetUserPageConfig(ctx context.Context, userID int64) (UserP
 	const q = `
 		SELECT
 			COALESCE(herosms_api_key, ''),
+			COALESCE(herosms_template_name, ''),
+			COALESCE(herosms_service, ''),
+			herosms_country,
+			COALESCE(herosms_operator, ''),
+			herosms_max_price,
+			herosms_owner,
+			herosms_activation,
+			herosms_amount,
+			COALESCE(herosms_templates, '[]'),
+			COALESCE(herosms_fast_handoff_seconds, 60),
 			COALESCE(duck_authorization, ''),
 			register_count,
 			email_count,
@@ -186,8 +217,19 @@ func (r *Repository) GetUserPageConfig(ctx context.Context, userID int64) (UserP
 		LIMIT 1
 	`
 	groupIDsRaw := "[]"
+	templatesRaw := "[]"
 	if err := r.db.QueryRowContext(ctx, q, userID).Scan(
 		&config.HeroSMSAPIKey,
+		&config.HeroSMSTemplate.Name,
+		&config.HeroSMSTemplate.Service,
+		&config.HeroSMSTemplate.Country,
+		&config.HeroSMSTemplate.Operator,
+		&config.HeroSMSTemplate.MaxPrice,
+		&config.HeroSMSTemplate.Owner,
+		&config.HeroSMSTemplate.ActivationType,
+		&config.HeroSMSTemplate.Amount,
+		&templatesRaw,
+		&config.HeroSMSFastHandoffSeconds,
 		&config.DuckAuthorization,
 		&config.RegisterCount,
 		&config.EmailCount,
@@ -209,6 +251,7 @@ func (r *Repository) GetUserPageConfig(ctx context.Context, userID int64) (UserP
 		return config, fmt.Errorf("query user page config: %w", err)
 	}
 	config.CustomSub2API.GroupIDs = parseConfigGroupIDs(groupIDsRaw)
+	config.HeroSMSTemplates = parseHeroSMSTemplates(templatesRaw)
 	return normalizeUserPageConfig(config), nil
 }
 
@@ -221,10 +264,24 @@ func (r *Repository) SaveUserPageConfig(ctx context.Context, userID int64, confi
 	if b, err := json.Marshal(positiveGroupIDs(config.CustomSub2API.GroupIDs)); err == nil {
 		groupIDsRaw = string(b)
 	}
+	templatesRaw := "[]"
+	if b, err := json.Marshal(config.HeroSMSTemplates); err == nil {
+		templatesRaw = string(b)
+	}
 	const q = `
 		INSERT INTO register_user_page_config (
 			user_id,
 			herosms_api_key,
+			herosms_template_name,
+			herosms_service,
+			herosms_country,
+			herosms_operator,
+			herosms_max_price,
+			herosms_owner,
+			herosms_activation,
+			herosms_amount,
+			herosms_templates,
+			herosms_fast_handoff_seconds,
 			duck_authorization,
 			register_count,
 			email_count,
@@ -239,9 +296,19 @@ func (r *Repository) SaveUserPageConfig(ctx context.Context, userID int64, confi
 			custom_sub2api_group_ids,
 			custom_sub2api_proxy_id
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
 		ON CONFLICT (user_id) DO UPDATE
 		SET herosms_api_key = EXCLUDED.herosms_api_key,
+		    herosms_template_name = EXCLUDED.herosms_template_name,
+		    herosms_service = EXCLUDED.herosms_service,
+		    herosms_country = EXCLUDED.herosms_country,
+		    herosms_operator = EXCLUDED.herosms_operator,
+		    herosms_max_price = EXCLUDED.herosms_max_price,
+		    herosms_owner = EXCLUDED.herosms_owner,
+		    herosms_activation = EXCLUDED.herosms_activation,
+		    herosms_amount = EXCLUDED.herosms_amount,
+		    herosms_templates = EXCLUDED.herosms_templates,
+		    herosms_fast_handoff_seconds = EXCLUDED.herosms_fast_handoff_seconds,
 		    duck_authorization = EXCLUDED.duck_authorization,
 		    register_count = EXCLUDED.register_count,
 		    email_count = EXCLUDED.email_count,
@@ -263,6 +330,16 @@ func (r *Repository) SaveUserPageConfig(ctx context.Context, userID int64, confi
 		q,
 		userID,
 		config.HeroSMSAPIKey,
+		config.HeroSMSTemplate.Name,
+		config.HeroSMSTemplate.Service,
+		config.HeroSMSTemplate.Country,
+		config.HeroSMSTemplate.Operator,
+		config.HeroSMSTemplate.MaxPrice,
+		config.HeroSMSTemplate.Owner,
+		config.HeroSMSTemplate.ActivationType,
+		config.HeroSMSTemplate.Amount,
+		templatesRaw,
+		config.HeroSMSFastHandoffSeconds,
 		config.DuckAuthorization,
 		config.RegisterCount,
 		config.EmailCount,
@@ -351,20 +428,30 @@ func (r *Repository) CountUserEmailsCreatedSince(ctx context.Context, userID int
 	return count, nil
 }
 
-func (r *Repository) ClaimUnusedUserEmail(ctx context.Context, userID int64, exclude map[string]struct{}) (*UserEmail, error) {
+func (r *Repository) ReserveUnusedUserEmail(ctx context.Context, userID, accountID int64, exclude map[string]struct{}) (*UserEmail, error) {
+	if userID <= 0 || accountID <= 0 {
+		return nil, fmt.Errorf("user_id 或 account_id 无效")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("reserve user_email begin: %w", err)
+	}
+	defer tx.Rollback()
 	const q = `
 		SELECT id, user_id, email, provider, used_at, COALESCE(account_id, 0), created_at, updated_at
 		FROM user_email
 		WHERE user_id = $1
 		  AND used_at IS NULL
 		ORDER BY id ASC
+		FOR UPDATE SKIP LOCKED
 		LIMIT 100
 	`
-	rows, err := r.db.QueryContext(ctx, q, userID)
+	rows, err := tx.QueryContext(ctx, q, userID)
 	if err != nil {
-		return nil, fmt.Errorf("query user_email: %w", err)
+		return nil, fmt.Errorf("query reservable user_email: %w", err)
 	}
 	defer rows.Close()
+	var chosen *UserEmail
 	for rows.Next() {
 		email := UserEmail{}
 		var usedAt sql.NullTime
@@ -377,12 +464,40 @@ func (r *Repository) ClaimUnusedUserEmail(ctx context.Context, userID int64, exc
 		if _, ok := exclude[strings.ToLower(strings.TrimSpace(email.Email))]; ok {
 			continue
 		}
-		return &email, nil
+		chosen = &email
+		break
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	return nil, nil
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if chosen == nil {
+		return nil, nil
+	}
+	const updateQ = `
+		UPDATE user_email
+		SET used_at = NOW(),
+		    account_id = $2,
+		    updated_at = NOW()
+		WHERE id = $1
+		  AND used_at IS NULL
+		RETURNING used_at, updated_at
+	`
+	var usedAt time.Time
+	if err := tx.QueryRowContext(ctx, updateQ, chosen.ID, accountID).Scan(&usedAt, &chosen.UpdatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reserve user_email update: %w", err)
+	}
+	chosen.UsedAt = &usedAt
+	chosen.AccountID = accountID
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("reserve user_email commit: %w", err)
+	}
+	return chosen, nil
 }
 
 func (r *Repository) InsertUserPhoneAccount(ctx context.Context, session Session) (int64, error) {
@@ -420,6 +535,76 @@ func (r *Repository) UpdateUserAccountStatus(ctx context.Context, accountID int6
 	return nil
 }
 
+func (r *Repository) GetUserAccountByID(ctx context.Context, userID, accountID int64) (*UserAccount, error) {
+	if userID <= 0 || accountID <= 0 {
+		return nil, fmt.Errorf("user_id 或 account_id 无效")
+	}
+	const q = `
+		SELECT
+			id,
+			user_id,
+			COALESCE(user_email_id, 0),
+			phone,
+			COALESCE(email, ''),
+			password,
+			COALESCE(name, ''),
+			COALESCE(birthdate, ''),
+			status,
+			COALESCE(error, ''),
+			created_at,
+			updated_at
+		FROM user_phone_accounts
+		WHERE user_id = $1
+		  AND id = $2
+		LIMIT 1
+	`
+	account := UserAccount{}
+	if err := r.db.QueryRowContext(ctx, q, userID, accountID).Scan(
+		&account.ID,
+		&account.UserID,
+		&account.UserEmailID,
+		&account.Phone,
+		&account.Email,
+		&account.Password,
+		&account.Name,
+		&account.Birthdate,
+		&account.Status,
+		&account.Error,
+		&account.CreatedAt,
+		&account.UpdatedAt,
+	); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("账号不存在或不属于当前用户")
+		}
+		return nil, fmt.Errorf("query user account: %w", err)
+	}
+	return &account, nil
+}
+
+func (r *Repository) QueueUserAccountLogin(ctx context.Context, userID, accountID int64) error {
+	if userID <= 0 || accountID <= 0 {
+		return fmt.Errorf("user_id 或 account_id 无效")
+	}
+	const q = `
+		UPDATE user_phone_accounts
+		SET status = 'queued_login',
+		    error = '',
+		    updated_at = NOW()
+		WHERE user_id = $1
+		  AND id = $2
+		  AND status IN ('failed', 'registered', 'queued_login')
+	`
+	result, err := r.db.ExecContext(ctx, q, userID, accountID)
+	if err != nil {
+		return fmt.Errorf("queue user account login: %w", err)
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return fmt.Errorf("账号当前状态不允许重新登录上传")
+	}
+	return nil
+}
+
 func (r *Repository) AttachUserEmailToAccount(ctx context.Context, accountID int64, email UserEmail) error {
 	if accountID <= 0 || email.ID <= 0 || strings.TrimSpace(email.Email) == "" {
 		return fmt.Errorf("account_id 或 user_email 无效")
@@ -430,9 +615,15 @@ func (r *Repository) AttachUserEmailToAccount(ctx context.Context, accountID int
 		    email = $3,
 		    updated_at = NOW()
 		WHERE id = $1
+		  AND (user_email_id IS NULL OR user_email_id = $2)
 	`
-	if _, err := r.db.ExecContext(ctx, q, accountID, email.ID, email.Email); err != nil {
+	result, err := r.db.ExecContext(ctx, q, accountID, email.ID, email.Email)
+	if err != nil {
 		return fmt.Errorf("attach user_email to account: %w", err)
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return fmt.Errorf("账号邮箱绑定状态冲突")
 	}
 	return nil
 }
@@ -715,7 +906,7 @@ func (r *Repository) LatestUserAccounts(ctx context.Context, userID int64, limit
 		limit = 20
 	}
 	const q = `
-		SELECT id, user_id, phone, COALESCE(email, ''), password, status, COALESCE(error, ''), created_at, updated_at
+		SELECT id, user_id, COALESCE(user_email_id, 0), phone, COALESCE(email, ''), password, status, COALESCE(error, ''), created_at, updated_at
 		FROM user_phone_accounts
 		WHERE user_id = $1
 		ORDER BY id DESC
@@ -729,7 +920,7 @@ func (r *Repository) LatestUserAccounts(ctx context.Context, userID int64, limit
 	out := []UserAccount{}
 	for rows.Next() {
 		var item UserAccount
-		if err := rows.Scan(&item.ID, &item.UserID, &item.Phone, &item.Email, &item.Password, &item.Status, &item.Error, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.UserID, &item.UserEmailID, &item.Phone, &item.Email, &item.Password, &item.Status, &item.Error, &item.CreatedAt, &item.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, item)
@@ -872,15 +1063,25 @@ func normalizePhoneSearch(value string) string {
 }
 
 func defaultUserPageConfig() UserPageConfig {
+	defaultTemplate := DefaultTemplate()
 	return UserPageConfig{
-		RegisterCount: 1,
-		EmailCount:    1,
-		CustomSub2API: CustomSub2APIConfig{GroupIDs: []int64{}},
+		HeroSMSTemplate:           defaultTemplate,
+		HeroSMSTemplates:          []HeroSMSTemplate{defaultTemplate},
+		HeroSMSFastHandoffSeconds: defaultHeroSMSFastHandoffSeconds,
+		RegisterCount:             1,
+		EmailCount:                1,
+		CustomSub2API:             CustomSub2APIConfig{GroupIDs: []int64{}},
 	}
 }
 
 func normalizeUserPageConfig(config UserPageConfig) UserPageConfig {
 	config.HeroSMSAPIKey = strings.TrimSpace(config.HeroSMSAPIKey)
+	config.HeroSMSTemplate = normalizeHeroSMSTemplate(config.HeroSMSTemplate)
+	config.HeroSMSTemplates = normalizeHeroSMSTemplates(config.HeroSMSTemplates, config.HeroSMSTemplate)
+	if len(config.HeroSMSTemplates) > 0 {
+		config.HeroSMSTemplate = config.HeroSMSTemplates[0]
+	}
+	config.HeroSMSFastHandoffSeconds = normalizeHeroSMSFastHandoffSeconds(config.HeroSMSFastHandoffSeconds)
 	config.DuckAuthorization = strings.TrimSpace(config.DuckAuthorization)
 	config.GlobalProxy = strings.TrimSpace(config.GlobalProxy)
 	if config.RegisterCount <= 0 {
@@ -900,6 +1101,36 @@ func normalizeUserPageConfig(config UserPageConfig) UserPageConfig {
 	config.CustomSub2API.GroupIDs = positiveGroupIDs(config.CustomSub2API.GroupIDs)
 	config.CustomSub2API.ProxyID = strings.TrimSpace(config.CustomSub2API.ProxyID)
 	return config
+}
+
+func normalizeHeroSMSTemplates(templates []HeroSMSTemplate, fallback HeroSMSTemplate) []HeroSMSTemplate {
+	if len(templates) == 0 {
+		return []HeroSMSTemplate{normalizeHeroSMSTemplate(fallback)}
+	}
+	out := make([]HeroSMSTemplate, 0, len(templates))
+	for _, template := range templates {
+		normalized := normalizeHeroSMSTemplate(template)
+		out = append(out, normalized)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].SortOrder == out[j].SortOrder {
+			return false
+		}
+		return out[i].SortOrder < out[j].SortOrder
+	})
+	return out
+}
+
+func parseHeroSMSTemplates(raw string) []HeroSMSTemplate {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "[]" || raw == "{}" {
+		return nil
+	}
+	var templates []HeroSMSTemplate
+	if err := json.Unmarshal([]byte(raw), &templates); err == nil {
+		return templates
+	}
+	return nil
 }
 
 func parseConfigGroupIDs(raw string) []int64 {
